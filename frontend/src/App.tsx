@@ -3,10 +3,12 @@ import axios from 'axios'
 import { UploadCloud, FileText, Trash2, Paperclip, Copy } from 'lucide-react'
 
 type Message = { id: string; role: 'user'|'assistant'; text: string; sources?: any[] }
+type DocumentInfo = { document_id: string; filename: string; size: number; pages: number; status: string }
 
 export default function App(){
   const [sessionId, setSessionId] = useState<string | null>(null)
-  const [fileMeta, setFileMeta] = useState<any>(null)
+  const [documents, setDocuments] = useState<DocumentInfo[]>([])
+  const [selectedDocumentId, setSelectedDocumentId] = useState<string | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
   const [question, setQuestion] = useState('')
   const [loading, setLoading] = useState(false)
@@ -26,9 +28,9 @@ export default function App(){
   const handleDrop = (event: React.DragEvent<HTMLDivElement>) => {
     event.preventDefault()
     setDragActive(false)
-    const file = event.dataTransfer.files?.[0]
-    if (file) {
-      onFileSelected(file)
+    const files = Array.from(event.dataTransfer.files || [])
+    if (files.length) {
+      onFileSelected(undefined, files)
     }
   }
 
@@ -36,24 +38,38 @@ export default function App(){
     if(chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight
   },[messages])
 
-  const onFileSelected = async (f?: File) => {
-    const file = f || (fileInputRef.current?.files?.[0] ?? null)
-    if(!file) return
-    if(file.size > 25*1024*1024){
-      alert('File exceeds maximum upload size of 25 MB.')
+  const onFileSelected = async (f?: File, files?: File[]) => {
+    const selectedFiles = files?.length ? files : f ? [f] : Array.from(fileInputRef.current?.files ?? [])
+    if (selectedFiles.length === 0) return
+
+    const invalid = selectedFiles.find(file => !file.name.toLowerCase().endsWith('.pdf') || file.size > 25*1024*1024)
+    if (invalid) {
+      alert('Only PDFs under 25 MB are allowed.')
       return
     }
-    if(!file.name.toLowerCase().endsWith('.pdf')){
-      alert('Unsupported file type. Only PDFs allowed.')
-      return
-    }
+
     const form = new FormData()
-    form.append('file', file)
+    selectedFiles.forEach(file => form.append('files', file))
+    if (sessionId) {
+      form.append('session_id', sessionId)
+    }
+
     try{
       setLoading(true)
-      const res = await axios.post('http://localhost:8000/api/upload', form, { headers: {'Content-Type':'multipart/form-data'}})
-      setSessionId(res.data.session_id)
-      setFileMeta({filename: res.data.filename, size: res.data.size, pages: res.data.pages})
+      const res = await axios.post('http://localhost:8000/api/upload', form)
+      const uploadedDocuments = res.data?.documents ?? []
+      if (uploadedDocuments.length === 0) {
+        alert('Upload succeeded but no documents were returned.')
+        return
+      }
+      const newSessionId = res.data.session_id
+      setSessionId(newSessionId)
+      setDocuments(prev => {
+        const merged = [...prev, ...uploadedDocuments]
+        const uniqueDocs = Array.from(new Map(merged.map(doc => [doc.document_id, doc])).values())
+        return uniqueDocs
+      })
+      setSelectedDocumentId(prevId => prevId ?? uploadedDocuments[0]?.document_id ?? null)
       setMessages([])
     }catch(err:any){
       alert(err?.response?.data?.detail || 'Upload failed')
@@ -62,12 +78,13 @@ export default function App(){
 
   const sendQuestion = async () =>{
     if(!sessionId) return alert('Upload a document first')
+    if(!selectedDocumentId) return alert('Select a document first')
     if(!question.trim()) return
     const id = String(Date.now())
     setMessages(prev=>[...prev, {id, role:'user', text:question}])
     setLoading(true)
     try{
-      const res = await axios.post('http://localhost:8000/api/ask', {session_id: sessionId, question})
+      const res = await axios.post('http://localhost:8000/api/ask', {session_id: sessionId, question, document_id: selectedDocumentId})
       const ans = res.data.answer
       const sources = res.data.sources
       setMessages(prev=>[...prev, {id: id+'-ans', role:'assistant', text: ans, sources}])
@@ -81,9 +98,12 @@ export default function App(){
     if(!sessionId) return
     await axios.post('http://localhost:8000/api/clear', new URLSearchParams({session_id: sessionId}))
     setSessionId(null)
-    setFileMeta(null)
+    setDocuments([])
+    setSelectedDocumentId(null)
     setMessages([])
   }
+
+  const selectedDocument = documents.find(doc => doc.document_id === selectedDocumentId)
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) =>{
     if(e.key === 'Enter' && !e.shiftKey){
@@ -92,54 +112,95 @@ export default function App(){
   }
 
   return (
-    <div className="min-h-screen flex">
-      <aside className="w-80 p-6 bg-white shadow-lg">
-        <div className="flex items-center gap-2 mb-4">
-          <UploadCloud />
-          <h3 className="text-lg font-semibold">RAG PDF QA</h3>
+    <div className="min-h-screen flex bg-slate-50">
+      <aside className="w-80 p-6 bg-white shadow-xl border border-slate-200">
+        <div className="flex items-center gap-3 mb-5">
+          <div className="rounded-2xl bg-brand-500 p-3 text-white shadow-sm"><UploadCloud size={20} /></div>
+          <div>
+            <h3 className="text-xl font-semibold">Document QA</h3>
+            <p className="text-sm text-slate-500">Upload multiple PDFs and ask questions per document.</p>
+          </div>
         </div>
-        <div className="mb-4">
-          <label className="block text-sm text-gray-600">Upload</label>
+
+        <div className="mb-5">
+          <label className="block text-sm font-semibold text-slate-700">Upload PDFs</label>
           <div
-            className={`mt-2 border-dashed border-2 rounded-2xl text-center p-4 ${dragActive ? 'border-brand-500 bg-brand-50' : 'border-gray-200 bg-white'} cursor-pointer transition-colors duration-200`}
+            className={`mt-3 border-2 rounded-3xl p-5 text-center transition duration-200 ${dragActive ? 'border-brand-500 bg-brand-50' : 'border-slate-200 bg-white'}`}
             onClick={() => fileInputRef.current?.click()}
             onDragOver={handleDragOver}
             onDragLeave={handleDragLeave}
             onDrop={handleDrop}
           >
-            <div className="flex items-center justify-center gap-2 text-gray-500">
-              <FileText />
-              <div>
-                <div className="font-medium">Drag & drop your document</div>
-                <div className="text-xs">Maximum 100 pages • PDF</div>
-              </div>
+            <div className="flex flex-col items-center gap-3 text-slate-500">
+              <FileText size={26} />
+              <div className="text-sm font-medium">Drag & drop PDFs here</div>
+              <div className="text-xs">Upload one or more PDF files (max 25 MB each).</div>
             </div>
-            <div className="mt-3">
-              <input ref={fileInputRef} type="file" accept="application/pdf" className="hidden" onChange={(e)=>onFileSelected(e.target.files?.[0] ?? undefined)} />
-              <button className="mt-2 px-4 py-2 bg-brand-500 text-white rounded-md cursor-pointer" onClick={(e)=>{ e.stopPropagation(); fileInputRef.current?.click() }}>Browse</button>
+            <div className="mt-4">
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="application/pdf"
+                multiple
+                className="hidden"
+                onChange={(e)=>onFileSelected(undefined, Array.from(e.target.files ?? []))}
+              />
+              <button
+                type="button"
+                className="mt-2 inline-flex items-center justify-center px-4 py-2 rounded-full bg-brand-500 text-white shadow-sm hover:bg-brand-600"
+                onClick={(e)=>{ e.stopPropagation(); fileInputRef.current?.click() }}
+              >
+                Browse files
+              </button>
             </div>
           </div>
         </div>
 
-        {fileMeta ? (
-          <div className="mt-4 bg-gray-50 p-3 rounded-lg">
-            <div className="flex justify-between items-start">
+        {documents.length > 0 ? (
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
               <div>
-                <div className="text-sm font-medium">{fileMeta.filename}</div>
-                <div className="text-xs text-gray-500">{Math.round(fileMeta.size/1024)} KB • {fileMeta.pages} pages</div>
+                <p className="text-sm font-semibold text-slate-700">Uploaded PDFs</p>
+                <p className="text-xs text-slate-500">Select a document before asking.</p>
               </div>
-              <button className="text-red-500" onClick={clearAll}><Trash2 /></button>
+              <button
+                type="button"
+                className="text-sm text-red-600 hover:text-red-700"
+                onClick={clearAll}
+              >
+                Clear all
+              </button>
+            </div>
+            <div className="space-y-3">
+              {documents.map(doc => (
+                <button
+                  key={doc.document_id}
+                  type="button"
+                  className={`w-full text-left p-4 rounded-3xl border shadow-sm transition ${selectedDocumentId === doc.document_id ? 'border-brand-500 bg-brand-50 shadow-md' : 'border-slate-200 bg-white hover:border-slate-300'}`}
+                  onClick={() => setSelectedDocumentId(doc.document_id)}
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-semibold text-slate-800">{doc.filename}</p>
+                      <p className="mt-1 text-xs text-slate-500">{Math.round(doc.size/1024)} KB • {doc.pages} pages</p>
+                    </div>
+                    <div className={`flex items-center justify-center h-8 w-8 rounded-full border ${selectedDocumentId === doc.document_id ? 'border-brand-500 bg-brand-500 text-white' : 'border-slate-300 bg-white text-slate-400'}`}>
+                      {selectedDocumentId === doc.document_id ? '✓' : '○'}
+                    </div>
+                  </div>
+                </button>
+              ))}
             </div>
           </div>
         ) : (
-          <div className="mt-6 text-sm text-gray-500">Upload a document to start asking questions.</div>
+          <div className="rounded-3xl border border-dashed border-slate-200 bg-slate-50 p-4 text-sm text-slate-500">Upload documents to select one and start asking questions.</div>
         )}
-
       </aside>
 
       <main className="flex-1 p-6">
-        <header className="mb-4">
-          <h1 className="text-2xl font-semibold">Ask questions about your PDF</h1>
+        <header className="mb-6">
+          <h1 className="text-3xl font-semibold text-slate-900">Ask questions about your PDF</h1>
+          <p className="mt-2 text-sm text-slate-500">Choose a document and get precise answers from that file only.</p>
         </header>
 
         <div className="h-[60vh] overflow-auto p-4 bg-white rounded-2xl shadow-inner" ref={chatRef}>
@@ -170,12 +231,22 @@ export default function App(){
         </div>
 
         <div className="mt-4 bg-white p-4 rounded-2xl shadow-md">
+          {selectedDocument ? (
+            <div className="mb-4 rounded-3xl bg-slate-50 border border-slate-200 p-4 text-sm text-slate-700">
+              <div className="font-semibold">Selected document</div>
+              <div className="mt-1 text-slate-500">{selectedDocument.filename} • {Math.round(selectedDocument.size/1024)} KB • {selectedDocument.pages} pages</div>
+            </div>
+          ) : (
+            <div className="mb-4 rounded-3xl bg-rose-50 border border-rose-200 p-4 text-sm text-rose-700">
+              Select a document from the left panel before asking a question.
+            </div>
+          )}
           <textarea value={question} onChange={e=>setQuestion(e.target.value)} onKeyDown={onKeyDown} placeholder="Ask a question..." className="w-full p-3 rounded-md border" rows={3} />
           <div className="flex items-center justify-between mt-2">
             <div className="text-xs text-gray-500">Shift+Enter for newline • Enter to send</div>
             <div className="flex gap-2">
               <button className="px-4 py-2 bg-gray-100 rounded-md" onClick={()=>{setQuestion('')}}>Clear</button>
-              <button className="px-4 py-2 bg-brand-500 text-white rounded-md" onClick={sendQuestion} disabled={loading}>{loading? 'Loading...':'Send'}</button>
+              <button className="px-4 py-2 bg-brand-500 text-white rounded-md" onClick={sendQuestion} disabled={loading || !selectedDocumentId}>{loading? 'Loading...':'Send'}</button>
             </div>
           </div>
         </div>

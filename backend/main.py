@@ -17,7 +17,7 @@ from chromadb.utils import embedding_functions
 
 from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder
-from transformers import pipeline
+from groq import Groq
 
 
 # =========================================================
@@ -25,6 +25,8 @@ from transformers import pipeline
 # =========================================================
 
 load_dotenv()
+
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "./data/uploads")
 VECTOR_DIR = os.getenv("VECTOR_DIR", "./data/vectorstores")
@@ -44,6 +46,8 @@ app = FastAPI(title="RAG PDF QA Backend")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     ],
@@ -63,19 +67,6 @@ try:
 except Exception:
     reranker = None
 
-# Local LLM
-try:
-    llm = pipeline(
-        task="text-generation",
-        model="Qwen/Qwen2-0.5B-Instruct",
-        max_new_tokens=500,
-        do_sample=False,
-        temperature=0,
-        return_full_text=False,
-)
-except Exception:
-    llm = None
-
 # =========================================================
 # In-memory session store
 # =========================================================
@@ -87,17 +78,23 @@ sessions = {}
 # API Models
 # =========================================================
 
-class UploadResponse(BaseModel):
-    session_id: str
+class UploadedDocumentInfo(BaseModel):
+    document_id: str
     filename: str
     size: int
     pages: int
     status: str
 
 
+class UploadResponse(BaseModel):
+    session_id: str
+    documents: List[UploadedDocumentInfo]
+
+
 class AskRequest(BaseModel):
     session_id: str
     question: str
+    document_id: str
 
 
 # =========================================================
@@ -109,92 +106,165 @@ CHUNK_OVERLAP = 100
 CHUNK_SEPARATORS = ["\n\n", "\n", ". ", " "]
 
 
-def normalize_answer(text: str) -> str:
-    if not text:
-        return text
+# =========================================================
+# Answer Type Detection & Post-Processing Helpers
+# =========================================================
 
-    text = text.strip()
-    text = re.sub(r'(?i)^answer:\s*', '', text).strip()
+FALLBACK_RESPONSE = "I couldn't find that information in the uploaded PDF."
 
-    split_point = re.search(r'(?mi)^(Explanation|Note|Analysis|Reason)\b', text)
-    if split_point:
-        text = text[: split_point.start()].strip()
+
+def detect_answer_type(question: str) -> Dict[str, str]:
+    """
+    Analyzes the question to determine the target answer type (name, date, number, 
+    list, single value, summary, yes/no, or general explanation) and returns 
+    formatting directives to enforce in the LLM prompt.
+    """
+    q_lower = question.lower().strip()
+
+    # 1. Specific Single Value (Email, Phone, Capital, Address, Title, Website)
+    if re.search(r'\b(email|emails|phone|contact|capital|address|website|url|title)\b', q_lower):
+        return {
+            "type": "single_value",
+            "instruction": "The user is asking for a SPECIFIC SINGLE VALUE (e.g. email, phone, capital, title). Return ONLY that exact value from CONTEXT without additional narrative."
+        }
+
+    # 2. Name / Person / Author
+    if re.search(r'\b(who|author|authors|author\'s|whose|person|name|names)\b', q_lower):
+        return {
+            "type": "name",
+            "instruction": "The user is asking for a NAME. Output ONLY the exact name(s) found in CONTEXT without full narrative sentences."
+        }
+
+    # 3. Date / Time (using word boundaries to avoid false positives like 'candidate')
+    if re.search(r'\b(when|date|dates|year|years|month|months|day|days|time|deadline)\b', q_lower):
+        return {
+            "type": "date",
+            "instruction": "The user is asking for a DATE or TIME. Output ONLY the exact date or time value found in CONTEXT."
+        }
+
+    # 4. Number / Amount / Price / Quantity
+    if any(k in q_lower for k in ["how many", "how much", "number of"]) or re.search(r'\b(count|price|cost|salary|percentage|rate)\b', q_lower):
+        return {
+            "type": "number",
+            "instruction": "The user is asking for a NUMBER or QUANTITY. Output ONLY the numerical value or exact amount specified in CONTEXT."
+        }
+
+    # 5. List / Multiple items
+    if any(k in q_lower for k in ["what are all", "all the", "name all", "which ones"]) or re.search(r'\b(list|enumerate)\b', q_lower):
+        return {
+            "type": "list",
+            "instruction": "The user is asking for a LIST of items. Extract ONLY the matching items found in CONTEXT, formatted one item per line."
+        }
+
+    # 6. Yes / No questions
+    if re.match(r'^(is|are|was|were|do|does|did|can|could|should|would|will|has|have|had)\b', q_lower):
+        return {
+            "type": "yes_no",
+            "instruction": "The question is a Yes/No question. Start your response with 'Yes' or 'No', followed by a single factual sentence from CONTEXT if needed."
+        }
+
+    # 7. Summary
+    if re.search(r'\b(summarize|summary)\b', q_lower):
+        match_sent = re.search(r'(\d+|\w+)\s+sentences?', q_lower)
+        num_str = match_sent.group(1) if match_sent else "two"
+        return {
+            "type": "summary",
+            "instruction": f"Provide a concise summary ({num_str} sentences) using ONLY facts explicitly present in CONTEXT."
+        }
+
+    # 8. General / Explanation
+    return {
+        "type": "general",
+        "instruction": "Provide a concise, direct answer based strictly on the CONTEXT. Stop as soon as the question is answered."
+    }
+
+
+def clean_and_post_process_answer(raw_text: str, question: str, type_info: Dict[str, str], context: str) -> str:
+    """
+    Post-processes the LLM output:
+    - Removes duplicated text and lines
+    - Removes trailing unrelated content or conversational notes
+    - Removes unrequested section headers
+    - Verifies precision and strictly checks that extracted values appear in context
+    - Trims whitespace and defaults to fallback message if answer is missing or ungrounded.
+    """
+    if not raw_text or not raw_text.strip():
+        return FALLBACK_RESPONSE
+
+    text = raw_text.strip()
+    text = re.sub(r'(?i)^(answer|final answer|response):\s*', '', text).strip()
 
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    cleaned_lines = []
+    if not lines:
+        return FALLBACK_RESPONSE
+
+    first_line = lines[0]
+
+    # Check if first line indicates fallback
+    fallback_indicators = [
+        "i couldn't find", "could not find", "not mentioned", "not provided",
+        "no information", "cannot find", "not specified", "does not contain",
+        "not_found"
+    ]
+    if any(ind in first_line.lower() for ind in fallback_indicators):
+        return FALLBACK_RESPONSE
+
+    ans_type = type_info["type"]
+
+    # Single value / Name / Date / Number processing
+    if ans_type in ["name", "date", "number", "single_value"]:
+        if ":" in first_line and not first_line.lower().startswith("http"):
+            parts = first_line.split(":", 1)
+            if parts[1].strip():
+                first_line = parts[1].strip()
+        first_line = re.sub(r'(?i)^(the\s+[^=:\n]+?\s+(is|was|are|were))\s*', '', first_line).strip()
+
+        # Strict grounding verification: single values must be grounded in retrieved context
+        if first_line.lower() not in context.lower():
+            return FALLBACK_RESPONSE
+
+        return first_line
+
+    # List items processing
+    if ans_type == "list":
+        formatted_items = []
+        for line in lines:
+            if any(ind in line.lower() for ind in ["explanation:", "note:", "context:"]):
+                break
+            item = re.sub(r'^(?:\d+[\.\)]|[-*•])\s*', '', line).strip()
+            if item and item.lower() not in [i.lower() for i in formatted_items]:
+                # Grounding check for list item
+                if item.lower() in context.lower() or any(w.lower() in context.lower() for w in item.split() if len(w) > 3):
+                    formatted_items.append(item)
+        if formatted_items:
+            return "\n".join(formatted_items)
+        return FALLBACK_RESPONSE
+
+    # Yes / No processing
+    if ans_type == "yes_no":
+        if not re.match(r'(?i)^(yes|no)\b', first_line):
+            if "yes" in first_line.lower() and "no" not in first_line.lower():
+                first_line = "Yes. " + first_line
+            elif "no" in first_line.lower() and "yes" not in first_line.lower():
+                first_line = "No. " + first_line
+        return first_line
+
+    # General / Summary processing
+    valid_lines = []
     for line in lines:
-        line = re.sub(r'^(?:\d+[\.\)]|[-*•]|\(\d+\))\s*', '', line)
-        line = re.sub(r'^(?:number\s*\d+:?)\s*', '', line, flags=re.IGNORECASE)
-        if line:
-            cleaned_lines.append(line)
+        if any(ind in line.lower() for ind in ["explanation:", "note:", "context:", "question:"]):
+            break
+        valid_lines.append(line)
 
-    if len(cleaned_lines) > 1:
-        return '; '.join(cleaned_lines[:5])
-    elif len(cleaned_lines) == 1:
-        text = cleaned_lines[0]
+    res = "\n".join(valid_lines) if valid_lines else FALLBACK_RESPONSE
 
-    if re.fullmatch(r'[\d\.\s-]+', text):
-        return ''
+    # Grounding check for general/summary answers
+    words = [w for w in res.split() if len(w) > 3 and w.isalnum()]
+    if words and not any(w.lower() in context.lower() for w in words):
+        return FALLBACK_RESPONSE
 
-    text = re.sub(r'(?i)^(the answer is|answer is|it is|it was|it are)\s*', '', text).strip()
+    return res
 
-    if ':' in text and not text.lower().startswith('i couldn\'t find'):
-        tail = text.split(':', 1)[1].strip()
-        parts = re.split(r',\s*|;\s*|\sand\s|\sor\s', tail)
-        parts = [p.strip() for p in parts if p and not re.fullmatch(r'\d+[\.\)]?', p)]
-        if len(parts) > 1:
-            return '; '.join(parts[:5])
-
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    if sentences:
-        first_sentence = sentences[0].strip()
-        if first_sentence:
-            return first_sentence
-
-    return text
-
-
-def extract_list_items(text: str) -> str:
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    items = []
-    for line in lines:
-        m = re.match(r'^(?:\d+[\.\)]|[-*•])\s*(.+)$', line)
-        if m:
-            candidate = m.group(1).strip()
-            if candidate and not re.fullmatch(r'\d+[\.\)]?', candidate):
-                items.append(candidate)
-
-    if items:
-        return '; '.join(items[:10])
-
-    colon_match = re.search(r'^[^:\n]+:\s*(.+)$', text, flags=re.MULTILINE)
-    if colon_match:
-        tail = colon_match.group(1).strip()
-        parts = re.split(r',\s*|;\s*|\sand\s|\sor\s', tail)
-        parts = [p.strip() for p in parts if p and not re.fullmatch(r'\d+[\.\)]?', p)]
-        if len(parts) > 1:
-            return '; '.join(parts[:10])
-    return ''
-
-
-def extract_answer_from_context(text: str, question: str) -> str:
-    parsed = extract_list_items(text)
-    if parsed:
-        return parsed
-
-    if ':' in text:
-        colon_match = re.search(r'^[^:\n]+:\s*(.+)$', text, flags=re.MULTILINE)
-        if colon_match:
-            answer = normalize_answer(colon_match.group(1).strip())
-            if answer:
-                return answer
-
-    if any(keyword in question.lower() for keyword in ['college', 'colleges', 'branch', 'department', 'institute', 'university']):
-        candidate = normalize_answer(text)
-        if candidate and len(candidate.split()) <= 20:
-            return candidate
-
-    return ''
 
 
 def chunk_text(text: str) -> List[str]:
@@ -256,124 +326,167 @@ def get_chroma_client():
 # =========================================================
 
 @app.post("/api/upload", response_model=UploadResponse)
-async def upload_pdf(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".pdf"):
+async def upload_pdf(
+    files: List[UploadFile] = File(None),
+    session_id: str = Form(None),
+):
+    uploads: List[UploadFile] = files or []
+
+    if not uploads:
         raise HTTPException(
             status_code=400,
-            detail="Only PDF files are allowed."
+            detail="No PDF files were uploaded."
         )
 
-    contents = await file.read()
-
-    if len(contents) == 0:
-        raise HTTPException(
-            status_code=400,
-            detail="Uploaded PDF is empty."
-        )
-
-    size_mb = len(contents) / (1024 * 1024)
-
-    if size_mb > MAX_UPLOAD_MB:
-        raise HTTPException(
-            status_code=400,
-            detail=f"File exceeds maximum upload size of {MAX_UPLOAD_MB} MB."
-        )
-
-    session_id = str(uuid.uuid4())
-    save_path = os.path.join(UPLOAD_DIR, f"{session_id}.pdf")
-
-    with open(save_path, "wb") as f:
-        f.write(contents)
-
-    try:
-        reader = PdfReader(save_path)
-        num_pages = len(reader.pages)
-    except Exception:
-        if os.path.exists(save_path):
-            os.remove(save_path)
-
-        raise HTTPException(
-            status_code=400,
-            detail="Failed to read PDF file."
-        )
-
-    if num_pages == 0:
-        os.remove(save_path)
-
-        raise HTTPException(
-            status_code=400,
-            detail="Uploaded PDF is empty."
-        )
-
-    if num_pages > MAX_PAGES:
-        os.remove(save_path)
-
-        raise HTTPException(
-            status_code=400,
-            detail="File exceeds the maximum limit of 100 pages."
-        )
-
-    docs = []
-
-    for i, page in enumerate(reader.pages):
-        try:
-            text = page.extract_text() or ""
-        except Exception:
-            text = ""
-
-        for chunk in chunk_text(text):
-            docs.append({
-                "page": i + 1,
-                "content": chunk,
-            })
-
-    if not docs:
-        os.remove(save_path)
-
-        raise HTTPException(
-            status_code=400,
-            detail="No text could be extracted from the PDF."
-        )
-
-    collection_name = f"collection_{session_id}"
-
+    existing_session = sessions.get(session_id) if session_id else None
+    session_id = existing_session["session_id"] if existing_session else str(uuid.uuid4())
+    collection_name = existing_session["collection_name"] if existing_session else f"collection_{session_id}"
     client = get_chroma_client()
 
     embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name="all-MiniLM-L6-v2"
     )
 
-    collection = client.get_or_create_collection(
-        name=collection_name,
-        embedding_function=embedding_fn,
-        metadata={"session_id": session_id},
-    )
+    if existing_session:
+        collection = client.get_collection(
+            name=collection_name,
+            embedding_function=embedding_fn,
+        )
+        document_entries = existing_session["documents"]
+    else:
+        collection = client.get_or_create_collection(
+            name=collection_name,
+            embedding_function=embedding_fn,
+            metadata={"session_id": session_id},
+        )
+        document_entries = []
+    batch_docs: List[str] = []
+    batch_metadatas: List[Dict] = []
+    batch_ids: List[str] = []
+
+    for upload in uploads:
+        if not upload.filename.lower().endswith(".pdf"):
+            raise HTTPException(
+                status_code=400,
+                detail="Only PDF files are allowed."
+            )
+
+        contents = await upload.read()
+
+        if len(contents) == 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Uploaded PDF {upload.filename} is empty."
+            )
+
+        size_mb = len(contents) / (1024 * 1024)
+        if size_mb > MAX_UPLOAD_MB:
+            raise HTTPException(
+                status_code=400,
+                detail=f"File {upload.filename} exceeds maximum upload size of {MAX_UPLOAD_MB} MB."
+            )
+
+        document_id = str(uuid.uuid4())
+        save_path = os.path.join(UPLOAD_DIR, f"{document_id}.pdf")
+
+        with open(save_path, "wb") as f:
+            f.write(contents)
+
+        try:
+            reader = PdfReader(save_path)
+            num_pages = len(reader.pages)
+        except Exception:
+            if os.path.exists(save_path):
+                os.remove(save_path)
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to read PDF file {upload.filename}."
+            )
+
+        if num_pages == 0:
+            os.remove(save_path)
+            raise HTTPException(
+                status_code=400,
+                detail=f"Uploaded PDF {upload.filename} is empty."
+            )
+
+        if num_pages > MAX_PAGES:
+            os.remove(save_path)
+            raise HTTPException(
+                status_code=400,
+                detail=f"File {upload.filename} exceeds the maximum limit of {MAX_PAGES} pages."
+            )
+
+        docs = []
+        tokenized_docs = []
+
+        for i, page in enumerate(reader.pages):
+            try:
+                text = page.extract_text() or ""
+            except Exception:
+                text = ""
+
+            for chunk in chunk_text(text):
+                docs.append({
+                    "page": i + 1,
+                    "content": chunk,
+                    "document_id": document_id,
+                    "filename": upload.filename,
+                })
+                tokenized_docs.append(chunk.lower().split())
+
+        if not docs:
+            os.remove(save_path)
+            raise HTTPException(
+                status_code=400,
+                detail=f"No text could be extracted from PDF {upload.filename}."
+            )
+
+        document_entries.append({
+            "document_id": document_id,
+            "filename": upload.filename,
+            "size": len(contents),
+            "pages": num_pages,
+            "status": "ready",
+            "filepath": save_path,
+            "bm25": BM25Okapi(tokenized_docs),
+            "docs": docs,
+        })
+
+        for idx, doc in enumerate(docs):
+            batch_docs.append(doc["content"])
+            batch_metadatas.append({
+                "page": doc["page"],
+                "document_id": document_id,
+                "filename": upload.filename,
+            })
+            batch_ids.append(f"{session_id}-{document_id}-{idx}")
 
     collection.add(
-        documents=[d["content"] for d in docs],
-        metadatas=[{"page": d["page"]} for d in docs],
-        ids=[f"{session_id}-{i}" for i in range(len(docs))],
+        documents=batch_docs,
+        metadatas=batch_metadatas,
+        ids=batch_ids,
     )
 
-    tokenized_docs = [d["content"].lower().split() for d in docs]
-    bm25 = BM25Okapi(tokenized_docs)
-
     sessions[session_id] = {
-        "filename": file.filename,
-        "size": len(contents),
-        "pages": num_pages,
-        "uploaded_at": int(time.time()),
+        "session_id": session_id,
         "collection_name": collection_name,
-        "bm25": bm25,
-        "docs": docs,
+        "documents": document_entries,
+        "uploaded_at": int(time.time()),
     }
 
     return UploadResponse(
         session_id=session_id,
-        filename=file.filename,
-        size=len(contents),
-        pages=num_pages,
-        status="ready",
+        documents=[
+            UploadedDocumentInfo(
+                document_id=doc["document_id"],
+                filename=doc["filename"],
+                size=doc["size"],
+                pages=doc["pages"],
+                status=doc["status"],
+            )
+            for doc in document_entries
+        ],
     )
 
 
@@ -402,11 +515,23 @@ async def ask(req: AskRequest):
         embedding_function=embedding_fn,
     )
 
-    # Vector retrieval
+    selected_doc = next(
+        (doc for doc in session["documents"] if doc["document_id"] == req.document_id),
+        None,
+    )
+
+    if not selected_doc:
+        raise HTTPException(
+            status_code=404,
+            detail="Selected document not found in session.",
+        )
+
+    # Vector retrieval scoped to the selected document only
     vector_results = collection.query(
         query_texts=[req.question],
         n_results=10,
         include=["documents", "metadatas"],
+        where={"document_id": req.document_id},
     )
 
     vector_docs = (
@@ -421,9 +546,9 @@ async def ask(req: AskRequest):
         else []
     )
 
-    # BM25 retrieval
-    bm25 = session["bm25"]
-    docs = session["docs"]
+    # BM25 retrieval scoped to the selected document only
+    bm25 = selected_doc["bm25"]
+    docs = selected_doc["docs"]
 
     query_tokens = req.question.lower().split()
     scores = bm25.get_scores(query_tokens)
@@ -458,10 +583,12 @@ async def ask(req: AskRequest):
         seen_contents.add(doc)
         candidate_docs.append({"content": doc, "pages": [doc_item["page"]]})
 
+    # Filter out any empty chunks for retrieval robustness
+    candidate_docs = [doc for doc in candidate_docs if doc.get("content") and doc["content"].strip()]
+
     if not candidate_docs:
         return JSONResponse({
-            "answer": "I couldn't find that information in the uploaded PDF.",
-          
+            "answer": FALLBACK_RESPONSE,
         })
 
     if reranker is not None:
@@ -476,61 +603,77 @@ async def ask(req: AskRequest):
     else:
         top_docs_meta = candidate_docs[:5]
 
-    top_docs = [doc["content"] for doc in top_docs_meta]
+    # Build context from top non-empty relevant chunks
+    top_docs = [doc["content"].strip() for doc in top_docs_meta if doc["content"].strip()]
+    if not top_docs:
+        return JSONResponse({
+            "answer": FALLBACK_RESPONSE,
+        })
+
     context = "\n\n".join(top_docs)
+
+    # 1. Answer Type Detection
+    type_info = detect_answer_type(req.question)
 
     generated = None
 
-    if llm is not None:
-        prompt = f"""You are a document question-answering assistant.
+    # 2. Strict Grounded RAG Universal Prompt
+    prompt = f"""You are a document question-answering assistant.
 
 Answer the question using ONLY the information in the CONTEXT below.
 
 STRICT RULES:
-- Base your answer exclusively on the CONTEXT. Do not use outside knowledge, 
+
+- Base your answer exclusively on the CONTEXT. Do not use outside knowledge,
   do not infer, and do not guess.
-- Reproduce facts, names, numbers, and details EXACTLY as written in the 
+- Reproduce facts, names, numbers, and details EXACTLY as written in the
   CONTEXT — do not paraphrase or summarize when precision matters.
-- Identify precisely WHAT TYPE OF THING the question is asking for (e.g. a 
-  name, a title, a date, a quantity, a category). Return ONLY items that 
-  genuinely match that type — do not substitute a related but different 
-  type of item (e.g. do not return a category label when a specific name 
+- Identify precisely WHAT TYPE OF THING the question is asking for (e.g. a
+  name, a title, a date, a quantity, a category). Return ONLY items that
+  genuinely match that type — do not substitute a related but different
+  type of item (e.g. do not return a category label when a specific name
   was requested, or a description when a title was requested).
-- If the question asks about MULTIPLE items, include EVERY matching item 
+- If the question asks about MULTIPLE items, include EVERY matching item
   found in the CONTEXT, not just one or two.
-- If an item has MULTIPLE FIELDS or attached details (e.g. a name, a date, 
-  a number, a location), keep those fields TOGETHER on one line for that 
+- If an item has MULTIPLE FIELDS or attached details (e.g. a name, a date,
+  a number, a location), keep those fields TOGETHER on one line for that
   item — do not scatter or flatten them into a single unlabeled list.
 - Format each distinct item on its own line, in a clear and readable way.
-- Answer ONLY the specific topic asked about in the QUESTION, and STOP once 
-  that answer is complete. Do NOT continue into other topics or sections, 
+- Answer ONLY the specific topic asked about in the QUESTION, and STOP once
+  that answer is complete. Do NOT continue into other topics or sections,
   even if they appear later in the CONTEXT.
-- If you are unsure whether something belongs in the answer, LEAVE IT OUT 
+- If you are unsure whether something belongs in the answer, LEAVE IT OUT
   rather than guessing.
 - Do not add explanations, commentary, or anything beyond the direct answer.
 - If the CONTEXT does not contain the answer, respond EXACTLY with:
   I couldn't find that information in the uploaded PDF.
-Context:
+
+CONTEXT:
 {context}
 
-Question:
+QUESTION:
 {req.question}
 
-Answer:"""
+ANSWER:"""
+
     try:
-        result = llm(prompt)
-        raw = result[0].get("generated_text", "").strip()
-        raw = re.sub(r'(?i)^answer:\s*', '', raw).strip()
-        generated = raw
+        completion = groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=300,
+        )
+        raw = completion.choices[0].message.content.strip() if completion.choices else ""
+        generated = clean_and_post_process_answer(raw, req.question, type_info, context)
     except Exception:
         generated = None
 
     if not generated:
-        generated = "I couldn't find that information in the uploaded PDF."
+        generated = FALLBACK_RESPONSE
 
     return JSONResponse({
-    "answer": generated,
-})
+        "answer": generated,
+    })
 # =========================================================
 # Clear session
 # =========================================================
@@ -542,16 +685,12 @@ async def clear(session_id: str = Form(...)):
     if session:
         try:
             client = get_chroma_client()
-
             client.delete_collection(name=session["collection_name"])
 
-            uploaded = os.path.join(
-                UPLOAD_DIR,
-                f"{session_id}.pdf"
-            )
-
-            if os.path.exists(uploaded):
-                os.remove(uploaded)
+            for doc in session.get("documents", []):
+                filepath = doc.get("filepath")
+                if filepath and os.path.exists(filepath):
+                    os.remove(filepath)
 
         except Exception:
             pass

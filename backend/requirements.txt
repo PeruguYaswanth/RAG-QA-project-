@@ -11,3 +11,4 @@ pydantic
 rank_bm25
 openai
 requests
+groq
