@@ -1,0 +1,15 @@
+backend/.venv
+frontend/node_modules
+data
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+*.log
+.DS_Store
+*.swp
+venv/
+.venv/

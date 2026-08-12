@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+python-multipart
+chromadb
+sentence-transformers
+transformers
+PyPDF2
+python-dotenv
+aiofiles
+pydantic
+rank_bm25
+openai
+requests
