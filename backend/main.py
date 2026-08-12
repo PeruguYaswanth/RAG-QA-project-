@@ -50,7 +50,7 @@ app.add_middleware(
         "http://127.0.0.1:5174",
         "http://localhost:5173",
         "http://127.0.0.1:5173",
-        "https://rag-qa-project-h3vko4rwc-peruguyaswanths-projects.vercel.app",
+        "https://rag-qa-project-production-2063.up.railway.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
