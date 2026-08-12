@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react'
 import axios from 'axios'
-import { UploadCloud, FileText, Trash2, Paperclip, Copy } from 'lucide-react'
+import { UploadCloud, FileText, Paperclip } from 'lucide-react'
+const API_BASE = 'https://rag-qa-project-production.up.railway.app'
 
 type Message = { id: string; role: 'user'|'assistant'; text: string; sources?: any[] }
 type DocumentInfo = { document_id: string; filename: string; size: number; pages: number; status: string }
@@ -56,7 +57,7 @@ export default function App(){
 
     try{
       setLoading(true)
-      const res = await axios.post('http://localhost:8000/api/upload', form)
+      const res = await axios.post(`${API_BASE}/api/upload`, form)
       const uploadedDocuments = res.data?.documents ?? []
       if (uploadedDocuments.length === 0) {
         alert('Upload succeeded but no documents were returned.')
@@ -83,20 +84,36 @@ export default function App(){
     const id = String(Date.now())
     setMessages(prev=>[...prev, {id, role:'user', text:question}])
     setLoading(true)
-    try{
-      const res = await axios.post('http://localhost:8000/api/ask', {session_id: sessionId, question, document_id: selectedDocumentId})
-      const ans = res.data.answer
-      const sources = res.data.sources
-      setMessages(prev=>[...prev, {id: id+'-ans', role:'assistant', text: ans, sources}])
-      setQuestion('')
-    }catch(err:any){
-      alert(err?.response?.data?.detail || 'Error asking question')
-    }finally{setLoading(false)}
-  }
+try {
+  const res = await axios.post(`${API_BASE}/api/ask`, {
+    session_id: sessionId,
+    question,
+    document_id: selectedDocumentId,
+  })
+
+  const ans = res.data.answer
+  const sources = res.data.sources
+
+  setMessages(prev => [
+    ...prev,
+    {
+      id: id + '-ans',
+      role: 'assistant',
+      text: ans,
+      sources,
+    },
+  ])
+
+  setQuestion('')
+} catch (err: any) {
+  alert(err?.response?.data?.detail || 'Error asking question')
+} finally {
+  setLoading(false)
+}
 
   const clearAll = async () =>{
     if(!sessionId) return
-    await axios.post('http://localhost:8000/api/clear', new URLSearchParams({session_id: sessionId}))
+    await axios.post(`${API_BASE}/api/clear`, new URLSearchParams({session_id: sessionId}))
     setSessionId(null)
     setDocuments([])
     setSelectedDocumentId(null)
