@@ -53,6 +53,7 @@ app.add_middleware(
         "http://localhost:5174",
         "http://127.0.0.1:5174",
     ],
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -83,9 +84,7 @@ _embedding_fn = None
 def get_embedding_fn():
     global _embedding_fn
     if _embedding_fn is None:
-        _embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name="all-MiniLM-L6-v2"
-        )
+        _embedding_fn = embedding_functions.DefaultEmbeddingFunction()
     return _embedding_fn
 
 sessions = {}
