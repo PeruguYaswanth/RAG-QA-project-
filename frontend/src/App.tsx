@@ -44,9 +44,9 @@ export default function App() {
     const selectedFiles = files?.length ? files : f ? [f] : Array.from(fileInputRef.current?.files ?? [])
     if (selectedFiles.length === 0) return
 
-    const invalid = selectedFiles.find(file => !file.name.toLowerCase().endsWith('.pdf') || file.size > 25 * 1024 * 1024)
+  const invalid = selectedFiles.find(file => !file.name.toLowerCase().endsWith('.pdf'))
     if (invalid) {
-      alert('Only PDFs under 25 MB are allowed.')
+      alert('Only PDF files are allowed.')
       return
     }
 
@@ -167,7 +167,7 @@ export default function App() {
               <div className="flex flex-col items-center gap-3 text-slate-500">
                 <FileText size={26} />
                 <div className="text-sm font-medium">Drag & drop PDFs here</div>
-                <div className="text-xs">Upload one or more PDF files (max 25 MB each).</div>
+                <div className="text-xs">Upload one or more PDF files (up to 100 pages each).</div>
               </div>
               <div className="mt-4">
                 <input
