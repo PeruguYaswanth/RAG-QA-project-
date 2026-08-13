@@ -2,6 +2,7 @@ import os
 import uuid
 import time
 import re
+import tempfile
 from collections import defaultdict
 from typing import Dict, List
 
@@ -16,7 +17,7 @@ import chromadb
 from chromadb.utils import embedding_functions
 
 from rank_bm25 import BM25Okapi
-from sentence_transformers import CrossEncoder
+# from sentence_transformers import CrossEncoder
 from groq import Groq
 
 
@@ -46,13 +47,12 @@ app = FastAPI(title="RAG PDF QA Backend")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:5174",
-        "http://127.0.0.1:5174",
+        "https://rag-qa-project.vercel.app",
         "http://localhost:5173",
         "http://127.0.0.1:5173",
-        "https://rag-qa-project.vercel.app",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
     ],
-    allow_origin_regex=r"https://.*-peruguyaswanths-projects\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -68,17 +68,17 @@ app.add_middleware(
 # Lazy-loaded models (avoid loading at startup to prevent OOM)
 # =========================================================
 
-_reranker = None
-_embedding_fn = None
+# _reranker = None
+# def get_reranker():
+#     global _reranker
+#     if _reranker is None:
+#         try:
+#             _reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+#         except Exception:
+#             _reranker = False  # mark as failed, avoid retrying every call
+#     return _reranker or None
 
-def get_reranker():
-    global _reranker
-    if _reranker is None:
-        try:
-            _reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-        except Exception:
-            _reranker = False  # mark as failed, avoid retrying every call
-    return _reranker or None
+_embedding_fn = None
 
 def get_embedding_fn():
     global _embedding_fn
@@ -398,60 +398,62 @@ async def upload_pdf(
 
 
         document_id = str(uuid.uuid4())
-        save_path = os.path.join(UPLOAD_DIR, f"{document_id}.pdf")
 
-        with open(save_path, "wb") as f:
-            f.write(contents)
+        # Temporary file creation and immediate cleanup to reduce Render free-tier storage usage
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(contents)
+            tmp_path = tmp.name
 
         try:
-            reader = PdfReader(save_path)
+            reader = PdfReader(tmp_path)
             num_pages = len(reader.pages)
+
+            if num_pages == 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Uploaded PDF {upload.filename} is empty."
+                )
+
+            if num_pages > MAX_PAGES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"File {upload.filename} exceeds the maximum limit of {MAX_PAGES} pages."
+                )
+
+            docs = []
+            tokenized_docs = []
+
+            for i, page in enumerate(reader.pages):
+                try:
+                    text = page.extract_text() or ""
+                except Exception:
+                    text = ""
+
+                for chunk in chunk_text(text):
+                    docs.append({
+                        "page": i + 1,
+                        "content": chunk,
+                        "document_id": document_id,
+                        "filename": upload.filename,
+                    })
+                    tokenized_docs.append(chunk.lower().split())
+
+            if not docs:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"No text could be extracted from PDF {upload.filename}."
+                )
+        except HTTPException:
+            raise
         except Exception:
-            if os.path.exists(save_path):
-                os.remove(save_path)
             raise HTTPException(
                 status_code=400,
                 detail=f"Failed to read PDF file {upload.filename}."
             )
-
-        if num_pages == 0:
-            os.remove(save_path)
-            raise HTTPException(
-                status_code=400,
-                detail=f"Uploaded PDF {upload.filename} is empty."
-            )
-
-        if num_pages > MAX_PAGES:
-            os.remove(save_path)
-            raise HTTPException(
-                status_code=400,
-                detail=f"File {upload.filename} exceeds the maximum limit of {MAX_PAGES} pages."
-            )
-
-        docs = []
-        tokenized_docs = []
-
-        for i, page in enumerate(reader.pages):
-            try:
-                text = page.extract_text() or ""
-            except Exception:
-                text = ""
-
-            for chunk in chunk_text(text):
-                docs.append({
-                    "page": i + 1,
-                    "content": chunk,
-                    "document_id": document_id,
-                    "filename": upload.filename,
-                })
-                tokenized_docs.append(chunk.lower().split())
-
-        if not docs:
-            os.remove(save_path)
-            raise HTTPException(
-                status_code=400,
-                detail=f"No text could be extracted from PDF {upload.filename}."
-            )
+        finally:
+            # Clean up temporary PDF file immediately to reduce Render free-tier storage usage
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
         document_entries.append({
             "document_id": document_id,
@@ -459,7 +461,6 @@ async def upload_pdf(
             "size": len(contents),
             "pages": num_pages,
             "status": "ready",
-            "filepath": save_path,
             "bm25": BM25Okapi(tokenized_docs),
             "docs": docs,
         })
@@ -599,18 +600,8 @@ async def ask(req: AskRequest):
             "answer": FALLBACK_RESPONSE,
         })
 
-    active_reranker = get_reranker()
-    if active_reranker is not None:
-        pairs = [(req.question, doc["content"]) for doc in candidate_docs]
-        rerank_scores = active_reranker.predict(pairs)
-        ranked = sorted(
-            zip(rerank_scores, candidate_docs),
-            key=lambda x: x[0],
-            reverse=True,
-        )
-        top_docs_meta = [doc for _, doc in ranked[:5]]
-    else:
-        top_docs_meta = candidate_docs[:5]
+    # Lightweight fallback: use retrieved Chroma and BM25 candidate documents directly
+    top_docs_meta = candidate_docs[:5]
 
     # Build context from top non-empty relevant chunks
     top_docs = [doc["content"].strip() for doc in top_docs_meta if doc["content"].strip()]
