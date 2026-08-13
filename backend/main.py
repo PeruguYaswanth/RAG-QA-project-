@@ -64,21 +64,35 @@ app.add_middleware(
 # =========================================================
 
 # Reranker
-try:
-    reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-except Exception:
-    reranker = None
+# =========================================================
+# Lazy-loaded models (avoid loading at startup to prevent OOM)
+# =========================================================
+
+_reranker = None
+_embedding_fn = None
+
+def get_reranker():
+    global _reranker
+    if _reranker is None:
+        try:
+            _reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+        except Exception:
+            _reranker = False  # mark as failed, avoid retrying every call
+    return _reranker or None
+
+def get_embedding_fn():
+    global _embedding_fn
+    if _embedding_fn is None:
+        _embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name="all-MiniLM-L6-v2"
+        )
+    return _embedding_fn
+
+sessions = {}
 
 # =========================================================
 # In-memory session store
 # =========================================================
-
-
-embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-    model_name="all-MiniLM-L6-v2"
-    )
-
-sessions = {}
 
 
 # =========================================================
@@ -353,13 +367,13 @@ async def upload_pdf(
     if existing_session:
         collection = client.get_collection(
             name=collection_name,
-            embedding_function=embedding_fn,
+            embedding_function=get_embedding_fn()
         )
         document_entries = existing_session["documents"]
     else:
         collection = client.get_or_create_collection(
             name=collection_name,
-            embedding_function=embedding_fn,
+            embedding_function=get_embedding_fn(),
             metadata={"session_id": session_id},
         )
         document_entries = []
@@ -382,12 +396,6 @@ async def upload_pdf(
                 detail=f"Uploaded PDF {upload.filename} is empty."
             )
 
-        size_mb = len(contents) / (1024 * 1024)
-        if size_mb > MAX_UPLOAD_MB:
-            raise HTTPException(
-                status_code=400,
-                detail=f"File {upload.filename} exceeds maximum upload size of {MAX_UPLOAD_MB} MB."
-            )
 
         document_id = str(uuid.uuid4())
         save_path = os.path.join(UPLOAD_DIR, f"{document_id}.pdf")
@@ -512,7 +520,7 @@ async def ask(req: AskRequest):
 
     collection = client.get_collection(
         name=session["collection_name"],
-        embedding_function=embedding_fn,
+        embedding_function=get_embedding_fn(),
     )
 
     selected_doc = next(
@@ -591,9 +599,10 @@ async def ask(req: AskRequest):
             "answer": FALLBACK_RESPONSE,
         })
 
-    if reranker is not None:
+    active_reranker = get_reranker()
+    if active_reranker is not None:
         pairs = [(req.question, doc["content"]) for doc in candidate_docs]
-        rerank_scores = reranker.predict(pairs)
+        rerank_scores = active_reranker.predict(pairs)
         ranked = sorted(
             zip(rerank_scores, candidate_docs),
             key=lambda x: x[0],
