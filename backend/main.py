@@ -73,6 +73,11 @@ except Exception:
 # In-memory session store
 # =========================================================
 
+
+embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
+    model_name="all-MiniLM-L6-v2"
+    )
+
 sessions = {}
 
 
@@ -319,8 +324,7 @@ def chunk_text(text: str) -> List[str]:
 # Chroma client
 # =========================================================
 
-def get_chroma_client():
-    return chromadb.PersistentClient(path=VECTOR_DIR)
+chroma_client = chromadb.PersistentClient(path=VECTOR_DIR)
 
 
 # =========================================================
@@ -343,11 +347,8 @@ async def upload_pdf(
     existing_session = sessions.get(session_id) if session_id else None
     session_id = existing_session["session_id"] if existing_session else str(uuid.uuid4())
     collection_name = existing_session["collection_name"] if existing_session else f"collection_{session_id}"
-    client = get_chroma_client()
+    client = chroma_client
 
-    embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name="all-MiniLM-L6-v2"
-    )
 
     if existing_session:
         collection = client.get_collection(
@@ -506,11 +507,8 @@ async def ask(req: AskRequest):
             detail="Session not found or expired."
         )
 
-    client = get_chroma_client()
+    client = chroma_client
 
-    embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-        model_name="all-MiniLM-L6-v2"
-    )
 
     collection = client.get_collection(
         name=session["collection_name"],
@@ -686,7 +684,7 @@ async def clear(session_id: str = Form(...)):
 
     if session:
         try:
-            client = get_chroma_client()
+            client = chroma_client
             client.delete_collection(name=session["collection_name"])
 
             for doc in session.get("documents", []):

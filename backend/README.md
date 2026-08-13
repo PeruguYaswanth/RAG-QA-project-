@@ -1,13 +1,11 @@
-RAG Backend (FastAPI)
+---
+title: RAG Backend
+colorFrom: blue
+colorTo: purple
+sdk: docker
+app_port: 7860
+---
 
-- API endpoints:
-  - POST /api/upload -> upload PDF, validate, extract, create embeddings, store vector DB
-  - POST /api/ask -> question -> retrieve -> prompt -> answer
-  - POST /api/clear -> clear session data
+# RAG Backend
 
-Run:
-
-pip install -r requirements.txt
-uvicorn main:app --reload --port 8000
-
-Environment: copy .env.example to .env and fill keys.
+FastAPI backend for RAG using ChromaDB, SentenceTransformers, BM25, and a CrossEncoder reranker.
