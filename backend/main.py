@@ -36,8 +36,13 @@ load_dotenv(os.path.join(base_dir, ".env"))
 load_dotenv(os.path.join(base_dir, "..", ".env"))
 load_dotenv()
 
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+
+def get_groq_client():
+    key = os.getenv("GROQ_API_KEY")
+    if not key:
+        return None
+    return Groq(api_key=key)
 
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "./data/uploads")
 VECTOR_DIR = os.getenv("VECTOR_DIR", "./data/vectorstores")
@@ -643,11 +648,19 @@ QUESTION:
 
 ANSWER:"""
 
+    groq = get_groq_client()
+    if not groq:
+        logger.error("GROQ_API_KEY environment variable is not configured!")
+        return JSONResponse({
+            "answer": FALLBACK_RESPONSE,
+            "sources": [],
+        })
+
     candidate_models = [GROQ_MODEL] + [m for m in ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "groq/compound-mini"] if m != GROQ_MODEL]
 
     for model_name in candidate_models:
         try:
-            completion = groq_client.chat.completions.create(
+            completion = groq.chat.completions.create(
                 model=model_name,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0,
@@ -701,7 +714,7 @@ async def clear(session_id: str = Form(...)):
 
 
 # =========================================================
-# Status
+# Status & Health Check
 # =========================================================
 
 @app.get("/api/status")
@@ -715,3 +728,14 @@ async def status(session_id: str):
         )
 
     return s
+
+
+@app.get("/api/health")
+async def health():
+    groq_configured = bool(os.getenv("GROQ_API_KEY"))
+    return {
+        "status": "healthy",
+        "version": "1.2.0",
+        "groq_configured": groq_configured,
+        "model": GROQ_MODEL,
+    }
