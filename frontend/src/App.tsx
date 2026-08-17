@@ -7,6 +7,21 @@ const API_BASE = (import.meta.env.VITE_API_BASE as string) || 'http://127.0.0.1:
 type Message = { id: string; role: 'user' | 'assistant'; text: string; sources?: any[] }
 type DocumentInfo = { document_id: string; filename: string; size: number; pages: number; status: string }
 
+const getErrorMessage = (err: any, fallback: string): string => {
+  const detail = err?.response?.data?.detail
+  if (typeof detail === 'string') return detail
+  if (Array.isArray(detail)) {
+    return detail.map((d: any) => d?.msg || JSON.stringify(d)).join(', ')
+  }
+  if (detail && typeof detail === 'object') {
+    return JSON.stringify(detail)
+  }
+  if (err?.message === 'Network Error' || err?.code === 'ERR_NETWORK') {
+    return `Cannot connect to backend server at ${API_BASE}. Please ensure the backend is running.`
+  }
+  return err?.message || fallback
+}
+
 export default function App() {
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [documents, setDocuments] = useState<DocumentInfo[]>([])
@@ -14,13 +29,16 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([])
   const [question, setQuestion] = useState('')
   const [loading, setLoading] = useState(false)
+  const [uploading, setUploading] = useState(false)
   const [dragActive, setDragActive] = useState(false)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const chatRef = useRef<HTMLDivElement | null>(null)
 
   const handleDragOver = (event: React.DragEvent<HTMLDivElement>) => {
     event.preventDefault()
-    setDragActive(true)
+    if (!uploading && !loading) {
+      setDragActive(true)
+    }
   }
 
   const handleDragLeave = () => {
@@ -30,6 +48,7 @@ export default function App() {
   const handleDrop = (event: React.DragEvent<HTMLDivElement>) => {
     event.preventDefault()
     setDragActive(false)
+    if (uploading || loading) return
     const files = Array.from(event.dataTransfer.files || [])
     if (files.length) {
       onFileSelected(undefined, files)
@@ -38,13 +57,14 @@ export default function App() {
 
   useEffect(() => {
     if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight
-  }, [messages])
+  }, [messages, loading])
 
   const onFileSelected = async (f?: File, files?: File[]) => {
+    if (uploading || loading) return
     const selectedFiles = files?.length ? files : f ? [f] : Array.from(fileInputRef.current?.files ?? [])
     if (selectedFiles.length === 0) return
 
-  const invalid = selectedFiles.find(file => !file.name.toLowerCase().endsWith('.pdf'))
+    const invalid = selectedFiles.find(file => !file.name.toLowerCase().endsWith('.pdf'))
     if (invalid) {
       alert('Only PDF files are allowed.')
       return
@@ -57,7 +77,7 @@ export default function App() {
     }
 
     try {
-      setLoading(true)
+      setUploading(true)
       const res = await axios.post(`${API_BASE}/api/upload`, form)
       const uploadedDocuments = res.data?.documents ?? []
       if (uploadedDocuments.length === 0) {
@@ -74,9 +94,16 @@ export default function App() {
       })
       setSelectedDocumentId(prevId => prevId ?? uploadedDocuments[0]?.document_id ?? null)
     } catch (err: any) {
-      alert(err?.response?.data?.detail || 'Upload failed')
+      const errMsg = getErrorMessage(err, 'Upload failed')
+      alert(errMsg)
+      if (err?.response?.status === 404) {
+        // Reset expired session
+        setSessionId(null)
+        setDocuments([])
+        setSelectedDocumentId(null)
+      }
     } finally {
-      setLoading(false)
+      setUploading(false)
       if (fileInputRef.current) {
         fileInputRef.current.value = ''
       }
@@ -84,21 +111,26 @@ export default function App() {
   }
 
   const sendQuestion = async () => {
+    if (loading || uploading) return
     if (!sessionId) return alert('Upload a document first')
     if (!selectedDocumentId) return alert('Select a document first')
-    if (!question.trim()) return
+    const currentQ = question.trim()
+    if (!currentQ) return
+
     const id = String(Date.now())
-    setMessages(prev => [...prev, { id, role: 'user', text: question }])
+    setMessages(prev => [...prev, { id, role: 'user', text: currentQ }])
+    setQuestion('')
     setLoading(true)
+
     try {
       const res = await axios.post(`${API_BASE}/api/ask`, {
         session_id: sessionId,
-        question,
+        question: currentQ,
         document_id: selectedDocumentId,
       })
 
-      const ans = res.data.answer
-      const sources = res.data.sources
+      const ans = res.data?.answer || "I couldn't find that information in the uploaded PDF."
+      const sources = res.data?.sources || []
 
       setMessages(prev => [
         ...prev,
@@ -109,10 +141,15 @@ export default function App() {
           sources,
         },
       ])
-
-      setQuestion('')
     } catch (err: any) {
-      alert(err?.response?.data?.detail || 'Error asking question')
+      const errMsg = getErrorMessage(err, 'Error asking question')
+      alert(errMsg)
+      if (err?.response?.status === 404) {
+        // Reset expired session
+        setSessionId(null)
+        setDocuments([])
+        setSelectedDocumentId(null)
+      }
     } finally {
       setLoading(false)
     }
@@ -121,9 +158,9 @@ export default function App() {
   const clearAll = async () => {
     if (!sessionId) return
     try {
-      const params = new URLSearchParams()
-      params.append('session_id', sessionId)
-      await axios.post(`${API_BASE}/api/clear`, params)
+      const form = new FormData()
+      form.append('session_id', sessionId)
+      await axios.post(`${API_BASE}/api/clear`, form)
     } catch (err) {
       console.error('Error clearing session:', err)
     } finally {
@@ -139,7 +176,9 @@ export default function App() {
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
-      sendQuestion()
+      if (!loading && !uploading) {
+        sendQuestion()
+      }
     }
   }
 
@@ -158,15 +197,17 @@ export default function App() {
           <div className="mb-5">
             <label className="block text-sm font-semibold text-slate-700">Upload PDFs</label>
             <div
-              className={`mt-3 border-2 rounded-3xl p-5 text-center transition duration-200 ${dragActive ? 'border-brand-500 bg-brand-50' : 'border-slate-200 bg-white'}`}
-              onClick={() => fileInputRef.current?.click()}
+              className={`mt-3 border-2 rounded-3xl p-5 text-center transition duration-200 cursor-pointer ${dragActive ? 'border-brand-500 bg-brand-50' : 'border-slate-200 bg-white hover:border-slate-300'}`}
+              onClick={() => { if (!uploading) fileInputRef.current?.click() }}
               onDragOver={handleDragOver}
               onDragLeave={handleDragLeave}
               onDrop={handleDrop}
             >
               <div className="flex flex-col items-center gap-3 text-slate-500">
                 <FileText size={26} />
-                <div className="text-sm font-medium">Drag & drop PDFs here</div>
+                <div className="text-sm font-medium">
+                  {uploading ? 'Uploading & processing...' : 'Drag & drop PDFs here'}
+                </div>
                 <div className="text-xs">Upload one or more PDF files (up to 100 pages each).</div>
               </div>
               <div className="mt-4">
@@ -175,15 +216,17 @@ export default function App() {
                   type="file"
                   accept="application/pdf"
                   multiple
+                  disabled={uploading}
                   className="hidden"
                   onChange={(e) => onFileSelected(undefined, Array.from(e.target.files ?? []))}
                 />
                 <button
                   type="button"
-                  className="mt-2 inline-flex items-center justify-center px-4 py-2 rounded-full bg-brand-500 text-white shadow-sm hover:bg-brand-600"
+                  disabled={uploading}
+                  className={`mt-2 inline-flex items-center justify-center px-4 py-2 rounded-full text-white shadow-sm ${uploading ? 'bg-slate-400 cursor-not-allowed' : 'bg-brand-500 hover:bg-brand-600'}`}
                   onClick={(e) => { e.stopPropagation(); fileInputRef.current?.click() }}
                 >
-                  Browse files
+                  {uploading ? 'Uploading...' : 'Browse files'}
                 </button>
               </div>
             </div>
@@ -198,7 +241,8 @@ export default function App() {
                 </div>
                 <button
                   type="button"
-                  className="text-sm text-red-600 hover:text-red-700"
+                  disabled={loading || uploading}
+                  className="text-sm text-red-600 hover:text-red-700 disabled:opacity-50"
                   onClick={clearAll}
                 >
                   Clear all
@@ -260,7 +304,7 @@ export default function App() {
               </div>
             ))}
 
-            {loading && <div className="text-sm text-gray-500">Processing...</div>}
+            {loading && <div className="text-sm text-gray-500 italic py-2">Generating answer...</div>}
           </div>
 
           <div className="mt-4 bg-white p-4 rounded-2xl shadow-md">
@@ -274,12 +318,34 @@ export default function App() {
                 Select a document from the left panel before asking a question.
               </div>
             )}
-            <textarea value={question} onChange={e => setQuestion(e.target.value)} onKeyDown={onKeyDown} placeholder="Ask a question..." className="w-full p-3 rounded-md border" rows={3} />
+            <textarea
+              value={question}
+              onChange={e => setQuestion(e.target.value)}
+              onKeyDown={onKeyDown}
+              disabled={loading || !selectedDocumentId}
+              placeholder={selectedDocumentId ? "Ask a question about the selected PDF..." : "Select a document to ask questions..."}
+              className="w-full p-3 rounded-md border disabled:bg-slate-100"
+              rows={3}
+            />
             <div className="flex items-center justify-between mt-2">
               <div className="text-xs text-gray-500">Shift+Enter for newline • Enter to send</div>
               <div className="flex gap-2">
-                <button className="px-4 py-2 bg-gray-100 rounded-md" onClick={() => { setQuestion('') }}>Clear</button>
-                <button className="px-4 py-2 bg-brand-500 text-white rounded-md" onClick={sendQuestion} disabled={loading || !selectedDocumentId}>{loading ? 'Loading...' : 'Send'}</button>
+                <button
+                  type="button"
+                  className="px-4 py-2 bg-gray-100 rounded-md hover:bg-gray-200 disabled:opacity-50"
+                  onClick={() => { setQuestion('') }}
+                  disabled={loading || !question}
+                >
+                  Clear
+                </button>
+                <button
+                  type="button"
+                  className="px-4 py-2 bg-brand-500 text-white rounded-md hover:bg-brand-600 disabled:opacity-50"
+                  onClick={sendQuestion}
+                  disabled={loading || uploading || !selectedDocumentId || !question.trim()}
+                >
+                  {loading ? 'Thinking...' : 'Send'}
+                </button>
               </div>
             </div>
           </div>

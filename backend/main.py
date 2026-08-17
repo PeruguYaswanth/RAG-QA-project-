@@ -37,6 +37,7 @@ load_dotenv(os.path.join(base_dir, "..", ".env"))
 load_dotenv()
 
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+DEBUG = os.getenv("DEBUG", "false").lower() in ("true", "1", "yes")
 
 def get_groq_client():
     key = os.getenv("GROQ_API_KEY")
@@ -47,6 +48,7 @@ def get_groq_client():
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "./data/uploads")
 VECTOR_DIR = os.getenv("VECTOR_DIR", "./data/vectorstores")
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "25"))
+SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "3600"))
 MAX_PAGES = 100
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -67,8 +69,14 @@ app.add_middleware(
         "http://127.0.0.1:5173",
         "http://localhost:5174",
         "http://127.0.0.1:5174",
+        "http://localhost:5175",
+        "http://127.0.0.1:5175",
+        "http://localhost:4173",
+        "http://127.0.0.1:4173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
     ],
-    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?|https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -185,7 +193,7 @@ def detect_answer_type(question: str) -> Dict[str, str]:
         }
 
     # 5. List / Multiple items
-    if any(k in q_lower for k in ["what are all", "all the", "name all", "which ones"]) or re.search(r'\b(list|enumerate)\b', q_lower):
+    if any(k in q_lower for k in ["what are all", "all the", "name all", "which ones", "give me", "find all", "show all", "list of"]) or re.search(r'\b(list|enumerate|colleges|branches|courses|options)\b', q_lower):
         return {
             "type": "list",
             "instruction": "The user is asking for a LIST of items. Extract ONLY the matching items found in CONTEXT, formatted one item per line."
@@ -227,7 +235,8 @@ def _fuzzy_grounded(answer: str, context: str, min_ratio: float = 0.6) -> bool:
     the exact normalized substring match fails, so slight LLM rephrasing
     (e.g. added title, reordered words) doesn't trigger a false fallback."""
     norm_context = _normalize(context)
-    words = [w.strip(".,;:()") for w in answer.lower().split() if len(w.strip(".,;:()")) > 2]
+    words = [re.sub(r'^[^\w]+|[^\w]+$', '', w) for w in answer.lower().split()]
+    words = [w for w in words if len(w) > 2]
     if not words:
         return True
     matched = sum(1 for w in words if w in norm_context)
@@ -263,19 +272,62 @@ def clean_and_post_process_answer(raw_text: str, question: str, type_info: Dict[
         "not found in the uploaded",
         "not mentioned in the uploaded",
         "not provided in the uploaded",
+        "not found in the context",
+        "not mentioned in the context",
+        "not provided in the context",
+        "cannot be found in the context",
+        "could not be found in the context",
+        "not present in the uploaded",
+        "not mentioned in the provided",
+        "not found in the document",
     ]
     if any(ind in text.lower() for ind in fallback_indicators):
         return FALLBACK_RESPONSE
 
-    # Grounding check: verify that key words in answer appear in context
     norm_context = _normalize(context)
-    if not _fuzzy_grounded(text, norm_context, min_ratio=0.25):
-        # If words in answer have zero overlap with context, it may be a complete hallucination
-        if not any(w in norm_context for w in [w.strip(".,;:()") for w in text.lower().split() if len(w) > 3]):
-            return FALLBACK_RESPONSE
+    q_type = type_info.get("type", "general")
 
-    return text
+    if q_type in ["name", "date", "number", "single_value"]:
+        # 1. Exact normalized match
+        if _normalize(first_line) in norm_context:
+            return first_line
+        # 2. Fuzzy match fallback with 60% threshold
+        if _fuzzy_grounded(first_line, norm_context, min_ratio=0.6):
+            return first_line
+        return FALLBACK_RESPONSE
 
+    elif q_type == "yes_no":
+        # Check if response begins with Yes or No or is grounded in context
+        if _normalize(first_line) in norm_context or _fuzzy_grounded(text, norm_context, min_ratio=0.3):
+            return text
+        if re.match(r'^(yes|no)\b', first_line.lower()):
+            if len(lines) == 1 and len(first_line.split()) <= 3:
+                return text
+            if _fuzzy_grounded(text, norm_context, min_ratio=0.2):
+                return text
+        return FALLBACK_RESPONSE
+
+    elif q_type == "list":
+        valid_lines = []
+        for line in lines:
+            cleaned_line = re.sub(r'^[\*\-\d\.\s]+', '', line).strip()
+            if not cleaned_line:
+                continue
+            if _normalize(cleaned_line) in norm_context or _fuzzy_grounded(cleaned_line, norm_context, min_ratio=0.5):
+                valid_lines.append(line)
+        if valid_lines:
+            return "\n".join(valid_lines)
+        if _fuzzy_grounded(text, norm_context, min_ratio=0.3):
+            return text
+        return FALLBACK_RESPONSE
+
+    else:
+        # General / Summary / Explanation
+        if _normalize(text) in norm_context:
+            return text
+        if _fuzzy_grounded(text, norm_context, min_ratio=0.3):
+            return text
+        return FALLBACK_RESPONSE
 
 
 def chunk_text(text: str) -> List[str]:
@@ -319,7 +371,7 @@ def chunk_text(text: str) -> List[str]:
         if chunk:
             chunks.append(chunk)
 
-        start = max(start + 1, split_at - CHUNK_OVERLAP)
+        start = split_at - CHUNK_OVERLAP if split_at - CHUNK_OVERLAP > start else split_at
 
     return chunks
 
@@ -331,6 +383,21 @@ def chunk_text(text: str) -> List[str]:
 chroma_client = chromadb.PersistentClient(path=VECTOR_DIR)
 
 
+def cleanup_expired_sessions():
+    now = time.time()
+    expired_ids = [
+        sid for sid, sdata in list(sessions.items())
+        if now - sdata.get("uploaded_at", 0) > SESSION_TTL_SECONDS
+    ]
+    for sid in expired_ids:
+        sdata = sessions.pop(sid, None)
+        if sdata:
+            try:
+                chroma_client.delete_collection(name=sdata["collection_name"])
+            except Exception:
+                pass
+
+
 # =========================================================
 # Upload endpoint
 # =========================================================
@@ -340,6 +407,8 @@ async def upload_pdf(
     files: List[UploadFile] = File(None),
     session_id: str = Form(None),
 ):
+    cleanup_expired_sessions()
+
     uploads: List[UploadFile] = files or []
 
     if not uploads:
@@ -348,134 +417,170 @@ async def upload_pdf(
             detail="No PDF files were uploaded."
         )
 
-    existing_session = sessions.get(session_id) if session_id else None
-    session_id = existing_session["session_id"] if existing_session else str(uuid.uuid4())
-    collection_name = existing_session["collection_name"] if existing_session else f"collection_{session_id}"
-    client = chroma_client
+    is_new_session = False
+    if session_id:
+        existing_session = sessions.get(session_id)
+        if not existing_session:
+            raise HTTPException(
+                status_code=404,
+                detail="Session not found or expired."
+            )
+        collection_name = existing_session["collection_name"]
+    else:
+        is_new_session = True
+        session_id = str(uuid.uuid4())
+        collection_name = f"collection_{session_id}"
+        existing_session = None
 
+    client = chroma_client
 
     if existing_session:
         collection = client.get_collection(
             name=collection_name,
             embedding_function=get_embedding_fn()
         )
-        document_entries = existing_session["documents"]
     else:
         collection = client.get_or_create_collection(
             name=collection_name,
             embedding_function=get_embedding_fn(),
             metadata={"session_id": session_id},
         )
-        document_entries = []
+
+    new_document_entries: List[Dict] = []
     batch_docs: List[str] = []
     batch_metadatas: List[Dict] = []
     batch_ids: List[str] = []
 
-    for upload in uploads:
-        if not upload.filename.lower().endswith(".pdf"):
-            raise HTTPException(
-                status_code=400,
-                detail="Only PDF files are allowed."
-            )
+    try:
+        for upload in uploads:
+            if not upload.filename.lower().endswith(".pdf"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Only PDF files are allowed."
+                )
 
-        contents = await upload.read()
+            contents = await upload.read()
 
-        if len(contents) == 0:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Uploaded PDF {upload.filename} is empty."
-            )
-
-
-        document_id = str(uuid.uuid4())
-
-        # Temporary file creation and immediate cleanup to reduce Render free-tier storage usage
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(contents)
-            tmp_path = tmp.name
-
-        try:
-            reader = PdfReader(tmp_path)
-            num_pages = len(reader.pages)
-
-            if num_pages == 0:
+            if len(contents) == 0:
                 raise HTTPException(
                     status_code=400,
                     detail=f"Uploaded PDF {upload.filename} is empty."
                 )
 
-            if num_pages > MAX_PAGES:
+            if len(contents) > MAX_UPLOAD_MB * 1024 * 1024:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"File {upload.filename} exceeds the maximum limit of {MAX_PAGES} pages."
+                    detail=f"File {upload.filename} exceeds maximum size limit of {MAX_UPLOAD_MB} MB."
                 )
 
-            docs = []
-            tokenized_docs = []
+            document_id = str(uuid.uuid4())
 
-            for i, page in enumerate(reader.pages):
-                try:
-                    text = page.extract_text() or ""
-                except Exception:
-                    text = ""
+            # Temporary file creation and immediate cleanup to reduce Render free-tier storage usage
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(contents)
+                tmp_path = tmp.name
 
-                for chunk in chunk_text(text):
-                    docs.append({
-                        "page": i + 1,
-                        "content": chunk,
-                        "document_id": document_id,
-                        "filename": upload.filename,
-                    })
-                    tokenized_docs.append(chunk.lower().split())
+            try:
+                reader = PdfReader(tmp_path)
+                num_pages = len(reader.pages)
 
-            if not docs:
+                if num_pages == 0:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Uploaded PDF {upload.filename} is empty."
+                    )
+
+                if num_pages > MAX_PAGES:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"File {upload.filename} exceeds the maximum limit of {MAX_PAGES} pages."
+                    )
+
+                docs = []
+                tokenized_docs = []
+
+                for i, page in enumerate(reader.pages):
+                    try:
+                        text = page.extract_text() or ""
+                    except Exception as e:
+                        logger.warning(f"Failed to extract text from page {i+1} of {upload.filename}: {e}")
+                        text = ""
+
+                    chunks = chunk_text(text)
+                    if DEBUG:
+                        logger.info(f"[DEBUG] Upload '{upload.filename}' page {i+1}: extracted {len(text)} chars, produced {len(chunks)} chunks")
+
+                    for chunk in chunks:
+                        docs.append({
+                            "page": i + 1,
+                            "content": chunk,
+                            "document_id": document_id,
+                            "filename": upload.filename,
+                        })
+                        tokenized_docs.append(chunk.lower().split())
+
+                if not docs:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"No text could be extracted from PDF {upload.filename}."
+                    )
+            except HTTPException:
+                raise
+            except Exception:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"No text could be extracted from PDF {upload.filename}."
+                    detail=f"Failed to read PDF file {upload.filename}."
                 )
-        except HTTPException:
-            raise
-        except Exception:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Failed to read PDF file {upload.filename}."
-            )
-        finally:
-            # Clean up temporary PDF file immediately to reduce Render free-tier storage usage
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+            finally:
+                # Clean up temporary PDF file immediately to reduce Render free-tier storage usage
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
 
-        document_entries.append({
-            "document_id": document_id,
-            "filename": upload.filename,
-            "size": len(contents),
-            "pages": num_pages,
-            "status": "ready",
-            "bm25": BM25Okapi(tokenized_docs),
-            "docs": docs,
-        })
-
-        for idx, doc in enumerate(docs):
-            batch_docs.append(doc["content"])
-            batch_metadatas.append({
-                "page": doc["page"],
+            new_document_entries.append({
                 "document_id": document_id,
                 "filename": upload.filename,
+                "size": len(contents),
+                "pages": num_pages,
+                "status": "ready",
+                "bm25": BM25Okapi(tokenized_docs),
+                "docs": docs,
             })
-            batch_ids.append(f"{session_id}-{document_id}-{idx}")
 
-    collection.add(
-        documents=batch_docs,
-        metadatas=batch_metadatas,
-        ids=batch_ids,
-    )
+            for idx, doc in enumerate(docs):
+                batch_docs.append(doc["content"])
+                batch_metadatas.append({
+                    "page": doc["page"],
+                    "document_id": document_id,
+                    "filename": upload.filename,
+                })
+                batch_ids.append(f"{session_id}-{document_id}-{idx}")
 
-    sessions[session_id] = {
-        "session_id": session_id,
-        "collection_name": collection_name,
-        "documents": document_entries,
-        "uploaded_at": int(time.time()),
-    }
+        if batch_docs:
+            collection.add(
+                documents=batch_docs,
+                metadatas=batch_metadatas,
+                ids=batch_ids,
+            )
+
+        if existing_session:
+            existing_session["documents"].extend(new_document_entries)
+            all_documents = existing_session["documents"]
+        else:
+            sessions[session_id] = {
+                "session_id": session_id,
+                "collection_name": collection_name,
+                "documents": new_document_entries,
+                "uploaded_at": int(time.time()),
+            }
+            all_documents = new_document_entries
+
+    except Exception:
+        if is_new_session:
+            try:
+                client.delete_collection(name=collection_name)
+            except Exception:
+                pass
+        raise
 
     return UploadResponse(
         session_id=session_id,
@@ -487,7 +592,7 @@ async def upload_pdf(
                 pages=doc["pages"],
                 status=doc["status"],
             )
-            for doc in document_entries
+            for doc in all_documents
         ],
     )
 
@@ -498,6 +603,7 @@ async def upload_pdf(
 
 @app.post("/api/ask")
 async def ask(req: AskRequest):
+    cleanup_expired_sessions()
     session = sessions.get(req.session_id)
 
     if not session:
@@ -588,7 +694,7 @@ async def ask(req: AskRequest):
     if not candidate_docs:
         return JSONResponse({
             "answer": FALLBACK_RESPONSE,
-            "sources": [],
+          
         })
 
     # Use retrieved Chroma and BM25 candidate documents directly (top 10 chunks)
@@ -599,13 +705,17 @@ async def ask(req: AskRequest):
     if not top_docs:
         return JSONResponse({
             "answer": FALLBACK_RESPONSE,
-            "sources": [],
+           
         })
 
     context = "\n\n".join(top_docs)
 
     # 1. Answer Type Detection
     type_info = detect_answer_type(req.question)
+
+    if DEBUG:
+        logger.info(f"[DEBUG] Detected answer type: {type_info.get('type')} ({type_info.get('instruction')})")
+        logger.info(f"[DEBUG] Retrieved context (first 300 chars): {context[:300]!r}")
 
     generated = None
 
@@ -653,10 +763,10 @@ ANSWER:"""
         logger.error("GROQ_API_KEY environment variable is not configured!")
         return JSONResponse({
             "answer": FALLBACK_RESPONSE,
-            "sources": [],
+          
         })
 
-    candidate_models = [GROQ_MODEL] + [m for m in ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "groq/compound-mini"] if m != GROQ_MODEL]
+    candidate_models = [GROQ_MODEL] + [m for m in ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "groq/compound-mini", "groq/compound"] if m != GROQ_MODEL]
 
     for model_name in candidate_models:
         try:
@@ -664,12 +774,17 @@ ANSWER:"""
                 model=model_name,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0,
-                max_tokens=1024,
+                max_tokens=4096,
             )
             raw = completion.choices[0].message.content.strip() if completion.choices else ""
-            generated = clean_and_post_process_answer(raw, req.question, type_info, context)
-            if generated:
-                break
+            if DEBUG:
+                logger.info(f"[DEBUG] Raw LLM output from model '{model_name}': {raw!r}")
+            if raw:
+                generated = clean_and_post_process_answer(raw, req.question, type_info, context)
+                if DEBUG:
+                    logger.info(f"[DEBUG] Post-processed answer: {generated!r}")
+                if generated and generated != FALLBACK_RESPONSE:
+                    break
         except Exception as e:
             logger.error(f"Error generating answer with Groq model '{model_name}': {e}")
 
@@ -687,7 +802,7 @@ ANSWER:"""
 
     return JSONResponse({
         "answer": generated,
-        "sources": sources,
+      
     })
 # =========================================================
 # Clear session
@@ -695,6 +810,7 @@ ANSWER:"""
 
 @app.post("/api/clear")
 async def clear(session_id: str = Form(...)):
+    cleanup_expired_sessions()
     session = sessions.pop(session_id, None)
 
     if session:
@@ -719,6 +835,7 @@ async def clear(session_id: str = Form(...)):
 
 @app.get("/api/status")
 async def status(session_id: str):
+    cleanup_expired_sessions()
     s = sessions.get(session_id)
 
     if not s:
@@ -727,7 +844,20 @@ async def status(session_id: str):
             detail="Session not found"
         )
 
-    return s
+    return {
+        "session_id": s["session_id"],
+        "uploaded_at": s.get("uploaded_at"),
+        "documents": [
+            {
+                "document_id": doc["document_id"],
+                "filename": doc["filename"],
+                "size": doc["size"],
+                "pages": doc["pages"],
+                "status": doc["status"],
+            }
+            for doc in s.get("documents", [])
+        ],
+    }
 
 
 @app.get("/api/health")
