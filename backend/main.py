@@ -3,6 +3,7 @@ import uuid
 import time
 import re
 import tempfile
+import logging
 from collections import defaultdict
 from typing import Dict, List
 
@@ -20,14 +21,23 @@ from rank_bm25 import BM25Okapi
 # from sentence_transformers import CrossEncoder
 from groq import Groq
 
+# =========================================================
+# Setup Logging
+# =========================================================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("rag_backend")
 
 # =========================================================
 # Load environment variables
 # =========================================================
 
+base_dir = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(base_dir, ".env"))
+load_dotenv(os.path.join(base_dir, "..", ".env"))
 load_dotenv()
 
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "./data/uploads")
 VECTOR_DIR = os.getenv("VECTOR_DIR", "./data/vectorstores")
@@ -199,14 +209,33 @@ def detect_answer_type(question: str) -> Dict[str, str]:
     }
 
 
+def _normalize(s: str) -> str:
+    """Collapse whitespace and lowercase, so minor formatting differences
+    between the LLM's output and the raw context don't cause false negatives
+    in the grounding check."""
+    return re.sub(r'\s+', ' ', s.lower()).strip()
+
+
+def _fuzzy_grounded(answer: str, context: str, min_ratio: float = 0.6) -> bool:
+    """Looser grounding check: true if most significant words (len > 2) in
+    the answer also appear somewhere in the context. Used as a fallback when
+    the exact normalized substring match fails, so slight LLM rephrasing
+    (e.g. added title, reordered words) doesn't trigger a false fallback."""
+    norm_context = _normalize(context)
+    words = [w.strip(".,;:()") for w in answer.lower().split() if len(w.strip(".,;:()")) > 2]
+    if not words:
+        return True
+    matched = sum(1 for w in words if w in norm_context)
+    return (matched / len(words)) >= min_ratio
+
+
 def clean_and_post_process_answer(raw_text: str, question: str, type_info: Dict[str, str], context: str) -> str:
     """
     Post-processes the LLM output:
-    - Removes duplicated text and lines
-    - Removes trailing unrelated content or conversational notes
-    - Removes unrequested section headers
-    - Verifies precision and strictly checks that extracted values appear in context
-    - Trims whitespace and defaults to fallback message if answer is missing or ungrounded.
+    - Removes duplicated text and headers
+    - Strips 'Answer:' prefixes
+    - Verifies that answer is grounded in context
+    - Returns FALLBACK_RESPONSE if information was missing or not found.
     """
     if not raw_text or not raw_text.strip():
         return FALLBACK_RESPONSE
@@ -220,70 +249,27 @@ def clean_and_post_process_answer(raw_text: str, question: str, type_info: Dict[
 
     first_line = lines[0]
 
-    # Check if first line indicates fallback
+    # Explicit fallback indicators when LLM indicates data is missing
     fallback_indicators = [
-        "i couldn't find", "could not find", "not mentioned", "not provided",
-        "no information", "cannot find", "not specified", "does not contain",
-        "not_found"
+        "i couldn't find that information",
+        "could not find that information",
+        "i could not find any information",
+        "i couldn't find any information",
+        "not found in the uploaded",
+        "not mentioned in the uploaded",
+        "not provided in the uploaded",
     ]
-    if any(ind in first_line.lower() for ind in fallback_indicators):
+    if any(ind in text.lower() for ind in fallback_indicators):
         return FALLBACK_RESPONSE
 
-    ans_type = type_info["type"]
-
-    # Single value / Name / Date / Number processing
-    if ans_type in ["name", "date", "number", "single_value"]:
-        if ":" in first_line and not first_line.lower().startswith("http"):
-            parts = first_line.split(":", 1)
-            if parts[1].strip():
-                first_line = parts[1].strip()
-        first_line = re.sub(r'(?i)^(the\s+[^=:\n]+?\s+(is|was|are|were))\s*', '', first_line).strip()
-
-        # Strict grounding verification: single values must be grounded in retrieved context
-        if first_line.lower() not in context.lower():
+    # Grounding check: verify that key words in answer appear in context
+    norm_context = _normalize(context)
+    if not _fuzzy_grounded(text, norm_context, min_ratio=0.25):
+        # If words in answer have zero overlap with context, it may be a complete hallucination
+        if not any(w in norm_context for w in [w.strip(".,;:()") for w in text.lower().split() if len(w) > 3]):
             return FALLBACK_RESPONSE
 
-        return first_line
-
-    # List items processing
-    if ans_type == "list":
-        formatted_items = []
-        for line in lines:
-            if any(ind in line.lower() for ind in ["explanation:", "note:", "context:"]):
-                break
-            item = re.sub(r'^(?:\d+[\.\)]|[-*•])\s*', '', line).strip()
-            if item and item.lower() not in [i.lower() for i in formatted_items]:
-                # Grounding check for list item
-                if item.lower() in context.lower() or any(w.lower() in context.lower() for w in item.split() if len(w) > 3):
-                    formatted_items.append(item)
-        if formatted_items:
-            return "\n".join(formatted_items)
-        return FALLBACK_RESPONSE
-
-    # Yes / No processing
-    if ans_type == "yes_no":
-        if not re.match(r'(?i)^(yes|no)\b', first_line):
-            if "yes" in first_line.lower() and "no" not in first_line.lower():
-                first_line = "Yes. " + first_line
-            elif "no" in first_line.lower() and "yes" not in first_line.lower():
-                first_line = "No. " + first_line
-        return first_line
-
-    # General / Summary processing
-    valid_lines = []
-    for line in lines:
-        if any(ind in line.lower() for ind in ["explanation:", "note:", "context:", "question:"]):
-            break
-        valid_lines.append(line)
-
-    res = "\n".join(valid_lines) if valid_lines else FALLBACK_RESPONSE
-
-    # Grounding check for general/summary answers
-    words = [w for w in res.split() if len(w) > 3 and w.isalnum()]
-    if words and not any(w.lower() in context.lower() for w in words):
-        return FALLBACK_RESPONSE
-
-    return res
+    return text
 
 
 
@@ -328,7 +314,7 @@ def chunk_text(text: str) -> List[str]:
         if chunk:
             chunks.append(chunk)
 
-        start = max(split_at - CHUNK_OVERLAP, split_at)
+        start = max(start + 1, split_at - CHUNK_OVERLAP)
 
     return chunks
 
@@ -597,16 +583,18 @@ async def ask(req: AskRequest):
     if not candidate_docs:
         return JSONResponse({
             "answer": FALLBACK_RESPONSE,
+            "sources": [],
         })
 
-    # Lightweight fallback: use retrieved Chroma and BM25 candidate documents directly
-    top_docs_meta = candidate_docs[:5]
+    # Use retrieved Chroma and BM25 candidate documents directly (top 10 chunks)
+    top_docs_meta = candidate_docs[:10]
 
     # Build context from top non-empty relevant chunks
     top_docs = [doc["content"].strip() for doc in top_docs_meta if doc["content"].strip()]
     if not top_docs:
         return JSONResponse({
             "answer": FALLBACK_RESPONSE,
+            "sources": [],
         })
 
     context = "\n\n".join(top_docs)
@@ -644,8 +632,8 @@ STRICT RULES:
 - If you are unsure whether something belongs in the answer, LEAVE IT OUT
   rather than guessing.
 - Do not add explanations, commentary, or anything beyond the direct answer.
-- If the CONTEXT does not contain the answer, respond EXACTLY with:
-  I couldn't find that information in the uploaded PDF.
+- If the answer cannot be found in the CONTEXT, respond with: "{FALLBACK_RESPONSE}"
+ 
 
 CONTEXT:
 {context}
@@ -655,23 +643,38 @@ QUESTION:
 
 ANSWER:"""
 
-    try:
-        completion = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-            max_tokens=300,
-        )
-        raw = completion.choices[0].message.content.strip() if completion.choices else ""
-        generated = clean_and_post_process_answer(raw, req.question, type_info, context)
-    except Exception:
-        generated = None
+    candidate_models = [GROQ_MODEL] + [m for m in ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "groq/compound-mini"] if m != GROQ_MODEL]
+
+    for model_name in candidate_models:
+        try:
+            completion = groq_client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                max_tokens=1024,
+            )
+            raw = completion.choices[0].message.content.strip() if completion.choices else ""
+            generated = clean_and_post_process_answer(raw, req.question, type_info, context)
+            if generated:
+                break
+        except Exception as e:
+            logger.error(f"Error generating answer with Groq model '{model_name}': {e}")
 
     if not generated:
         generated = FALLBACK_RESPONSE
 
+    sources = []
+    if generated != FALLBACK_RESPONSE:
+        for doc in top_docs_meta:
+            for p in doc.get("pages", [1]):
+                sources.append({
+                    "page": p,
+                    "text": (doc.get("content", "")[:120] + "...") if len(doc.get("content", "")) > 120 else doc.get("content", "")
+                })
+
     return JSONResponse({
         "answer": generated,
+        "sources": sources,
     })
 # =========================================================
 # Clear session
