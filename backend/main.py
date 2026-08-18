@@ -48,6 +48,7 @@ def get_groq_client():
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "./data/uploads")
 VECTOR_DIR = os.getenv("VECTOR_DIR", "./data/vectorstores")
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "25"))
+EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "50"))
 SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "3600"))
 MAX_PAGES = 100
 
@@ -557,11 +558,12 @@ async def upload_pdf(
                 batch_ids.append(f"{session_id}-{document_id}-{idx}")
 
         if batch_docs:
-            collection.add(
-                documents=batch_docs,
-                metadatas=batch_metadatas,
-                ids=batch_ids,
-            )
+            for i in range(0, len(batch_docs), EMBED_BATCH_SIZE):
+                collection.add(
+                    documents=batch_docs[i:i+EMBED_BATCH_SIZE],
+                    metadatas=batch_metadatas[i:i+EMBED_BATCH_SIZE],
+                    ids=batch_ids[i:i+EMBED_BATCH_SIZE],
+                )
 
         if existing_session:
             existing_session["documents"].extend(new_document_entries)
