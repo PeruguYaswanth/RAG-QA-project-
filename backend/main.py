@@ -4,6 +4,7 @@ import time
 import re
 import tempfile
 import logging
+import gc
 from collections import defaultdict
 from typing import Dict, List
 
@@ -15,10 +16,9 @@ from dotenv import load_dotenv
 from PyPDF2 import PdfReader
 
 import chromadb
-from chromadb.utils import embedding_functions
+import cohere
 
 from rank_bm25 import BM25Okapi
-# from sentence_transformers import CrossEncoder
 from groq import Groq
 
 # =========================================================
@@ -86,31 +86,66 @@ app.add_middleware(
 
 
 # =========================================================
-# Models
+# Cohere Embedding API Client & Helper
 # =========================================================
 
-# Reranker
-# =========================================================
-# Lazy-loaded models (avoid loading at startup to prevent OOM)
-# =========================================================
+def get_cohere_client():
+    key = os.getenv("COHERE_API_KEY")
+    if not key:
+        return None
+    return cohere.Client(api_key=key)
 
-# _reranker = None
-# def get_reranker():
-#     global _reranker
-#     if _reranker is None:
-#         try:
-#             _reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-#         except Exception:
-#             _reranker = False  # mark as failed, avoid retrying every call
-#     return _reranker or None
 
-_embedding_fn = None
+import hashlib
+import math
 
-def get_embedding_fn():
-    global _embedding_fn
-    if _embedding_fn is None:
-        _embedding_fn = embedding_functions.DefaultEmbeddingFunction()
-    return _embedding_fn
+
+def _local_fallback_embeddings(texts: List[str], dim: int = 1024) -> List[List[float]]:
+    """
+    Zero-memory fallback 1024-dim embedding using hashed token frequencies.
+    Used for local development/testing when COHERE_API_KEY is not set.
+    """
+    embeddings = []
+    for text in texts:
+        vec = [0.0] * dim
+        tokens = text.lower().split()
+        for token in tokens:
+            idx = int(hashlib.md5(token.encode("utf-8")).hexdigest(), 16) % dim
+            vec[idx] += 1.0
+        norm = math.sqrt(sum(x * x for x in vec)) or 1.0
+        embeddings.append([x / norm for x in vec])
+    return embeddings
+
+
+def get_cohere_embeddings(texts: List[str], input_type: str = "search_document") -> List[List[float]]:
+    """
+    Generate embeddings using Cohere API (embed-english-v3.0, 1024 dims).
+    Computation happens on Cohere's servers, drastically capping in-process memory.
+    If COHERE_API_KEY is not configured, uses a zero-memory 1024-dim fallback.
+    """
+    if not texts:
+        return []
+    co = get_cohere_client()
+    if not co:
+        logger.warning("COHERE_API_KEY is not configured. Using zero-memory fallback embeddings.")
+        return _local_fallback_embeddings(texts, dim=1024)
+
+    all_embeddings: List[List[float]] = []
+    batch_size = 96
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        response = co.embed(
+            texts=batch,
+            model="embed-english-v3.0",
+            input_type=input_type,
+        )
+        if hasattr(response.embeddings, "float_") and response.embeddings.float_ is not None:
+            all_embeddings.extend(response.embeddings.float_)
+        elif isinstance(response.embeddings, list):
+            all_embeddings.extend(response.embeddings)
+        else:
+            all_embeddings.extend([list(e) for e in response.embeddings])
+    return all_embeddings
 
 sessions = {}
 
@@ -439,12 +474,12 @@ async def upload_pdf(
     if existing_session:
         collection = client.get_collection(
             name=collection_name,
-            embedding_function=get_embedding_fn()
+            embedding_function=None,
         )
     else:
         collection = client.get_or_create_collection(
             name=collection_name,
-            embedding_function=get_embedding_fn(),
+            embedding_function=None,
             metadata={"session_id": session_id},
         )
 
@@ -462,14 +497,15 @@ async def upload_pdf(
                 )
 
             contents = await upload.read()
+            file_size = len(contents)
 
-            if len(contents) == 0:
+            if file_size == 0:
                 raise HTTPException(
                     status_code=400,
                     detail=f"Uploaded PDF {upload.filename} is empty."
                 )
 
-            if len(contents) > MAX_UPLOAD_MB * 1024 * 1024:
+            if file_size > MAX_UPLOAD_MB * 1024 * 1024:
                 raise HTTPException(
                     status_code=400,
                     detail=f"File {upload.filename} exceeds maximum size limit of {MAX_UPLOAD_MB} MB."
@@ -534,14 +570,19 @@ async def upload_pdf(
                     detail=f"Failed to read PDF file {upload.filename}."
                 )
             finally:
-                # Clean up temporary PDF file immediately to reduce Render free-tier storage usage
+                # Clean up temporary PDF file and memory immediately to reduce memory usage
+                if 'reader' in locals():
+                    del reader
+                if 'contents' in locals():
+                    del contents
+                gc.collect()
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
 
             new_document_entries.append({
                 "document_id": document_id,
                 "filename": upload.filename,
-                "size": len(contents),
+                "size": file_size,
                 "pages": num_pages,
                 "status": "ready",
                 "bm25": BM25Okapi(tokenized_docs),
@@ -559,10 +600,15 @@ async def upload_pdf(
 
         if batch_docs:
             for i in range(0, len(batch_docs), EMBED_BATCH_SIZE):
+                chunk_docs = batch_docs[i:i+EMBED_BATCH_SIZE]
+                chunk_metadatas = batch_metadatas[i:i+EMBED_BATCH_SIZE]
+                chunk_ids = batch_ids[i:i+EMBED_BATCH_SIZE]
+                chunk_embeddings = get_cohere_embeddings(chunk_docs, input_type="search_document")
                 collection.add(
-                    documents=batch_docs[i:i+EMBED_BATCH_SIZE],
-                    metadatas=batch_metadatas[i:i+EMBED_BATCH_SIZE],
-                    ids=batch_ids[i:i+EMBED_BATCH_SIZE],
+                    documents=chunk_docs,
+                    embeddings=chunk_embeddings,
+                    metadatas=chunk_metadatas,
+                    ids=chunk_ids,
                 )
 
         if existing_session:
@@ -620,7 +666,7 @@ async def ask(req: AskRequest):
 
     collection = client.get_collection(
         name=session["collection_name"],
-        embedding_function=get_embedding_fn(),
+        embedding_function=None,
     )
 
     selected_doc = next(
@@ -634,9 +680,10 @@ async def ask(req: AskRequest):
             detail="Selected document not found in session.",
         )
 
-    # Vector retrieval scoped to the selected document only
+    # Vector retrieval scoped to the selected document only using Cohere search_query embeddings
+    query_embedding = get_cohere_embeddings([req.question], input_type="search_query")[0]
     vector_results = collection.query(
-        query_texts=[req.question],
+        query_embeddings=[query_embedding],
         n_results=10,
         include=["documents", "metadatas"],
         where={"document_id": req.document_id},
@@ -866,9 +913,11 @@ async def status(session_id: str):
 @app.get("/api/health")
 async def health():
     groq_configured = bool(os.getenv("GROQ_API_KEY"))
+    cohere_configured = bool(os.getenv("COHERE_API_KEY"))
     return {
         "status": "healthy",
-        "version": "1.2.0",
+        "version": "1.3.0",
         "groq_configured": groq_configured,
+        "cohere_configured": cohere_configured,
         "model": GROQ_MODEL,
     }

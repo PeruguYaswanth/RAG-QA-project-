@@ -2,8 +2,7 @@ fastapi
 uvicorn[standard]
 python-multipart
 chromadb
-sentence-transformers
-transformers
+cohere
 PyPDF2
 python-dotenv
 aiofiles
@@ -12,5 +11,3 @@ rank_bm25
 openai
 requests
 groq
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
