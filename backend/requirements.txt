@@ -11,3 +11,4 @@ rank_bm25
 openai
 requests
 groq
+python-docx

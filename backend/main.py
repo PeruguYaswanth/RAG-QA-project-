@@ -2,6 +2,7 @@ import os
 import uuid
 import time
 import re
+import io
 import tempfile
 import logging
 import gc
@@ -14,6 +15,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
+import docx
 
 import chromadb
 import cohere
@@ -435,9 +437,8 @@ def cleanup_expired_sessions():
                 pass
 
 
-# =========================================================
-# Upload endpoint
-# =========================================================
+ALLOWED_EXTENSIONS = {".pdf", ".docx", ".md", ".txt"}
+
 
 @app.post("/api/upload", response_model=UploadResponse)
 async def upload_pdf(
@@ -451,7 +452,7 @@ async def upload_pdf(
     if not uploads:
         raise HTTPException(
             status_code=400,
-            detail="No PDF files were uploaded."
+            detail="No files were uploaded."
         )
 
     is_new_session = False
@@ -490,10 +491,11 @@ async def upload_pdf(
 
     try:
         for upload in uploads:
-            if not upload.filename.lower().endswith(".pdf"):
+            ext = os.path.splitext(upload.filename or "")[1].lower()
+            if ext not in ALLOWED_EXTENSIONS:
                 raise HTTPException(
                     status_code=400,
-                    detail="Only PDF files are allowed."
+                    detail=f"Unsupported file format for '{upload.filename}'. Supported formats: PDF, DOCX, MD, TXT"
                 )
 
             contents = await upload.read()
@@ -502,7 +504,7 @@ async def upload_pdf(
             if file_size == 0:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Uploaded PDF {upload.filename} is empty."
+                    detail=f"Uploaded file {upload.filename} is empty."
                 )
 
             if file_size > MAX_UPLOAD_MB * 1024 * 1024:
@@ -512,72 +514,152 @@ async def upload_pdf(
                 )
 
             document_id = str(uuid.uuid4())
+            docs = []
+            tokenized_docs = []
+            num_pages = 1
 
-            # Temporary file creation and immediate cleanup to reduce Render free-tier storage usage
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                tmp.write(contents)
-                tmp_path = tmp.name
+            if ext == ".pdf":
+                # Temporary file creation and immediate cleanup to reduce Render free-tier storage usage
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                    tmp.write(contents)
+                    tmp_path = tmp.name
 
-            try:
-                reader = PdfReader(tmp_path)
-                num_pages = len(reader.pages)
+                try:
+                    reader = PdfReader(tmp_path)
+                    num_pages = len(reader.pages)
 
-                if num_pages == 0:
+                    if num_pages == 0:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Uploaded PDF {upload.filename} is empty."
+                        )
+
+                    if num_pages > MAX_PAGES:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"File {upload.filename} exceeds the maximum limit of {MAX_PAGES} pages."
+                        )
+
+                    for i, page in enumerate(reader.pages):
+                        try:
+                            text = page.extract_text() or ""
+                        except Exception as e:
+                            logger.warning(f"Failed to extract text from page {i+1} of {upload.filename}: {e}")
+                            text = ""
+
+                        chunks = chunk_text(text)
+                        if DEBUG:
+                            logger.info(f"[DEBUG] Upload '{upload.filename}' page {i+1}: extracted {len(text)} chars, produced {len(chunks)} chunks")
+
+                        for chunk in chunks:
+                            docs.append({
+                                "page": i + 1,
+                                "content": chunk,
+                                "document_id": document_id,
+                                "filename": upload.filename,
+                            })
+                            tokenized_docs.append(chunk.lower().split())
+
+                    if not docs:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"No text could be extracted from PDF {upload.filename}."
+                        )
+                except HTTPException:
+                    raise
+                except Exception:
                     raise HTTPException(
                         status_code=400,
-                        detail=f"Uploaded PDF {upload.filename} is empty."
+                        detail=f"Failed to read PDF file {upload.filename}."
                     )
+                finally:
+                    if 'reader' in locals():
+                        del reader
+                    if 'contents' in locals():
+                        del contents
+                    gc.collect()
+                    if os.path.exists(tmp_path):
+                        os.remove(tmp_path)
 
-                if num_pages > MAX_PAGES:
+            elif ext == ".docx":
+                try:
+                    doc_obj = docx.Document(io.BytesIO(contents))
+                    full_text_list = []
+                    for p in doc_obj.paragraphs:
+                        if p.text and p.text.strip():
+                            full_text_list.append(p.text.strip())
+                    for table in doc_obj.tables:
+                        for row in table.rows:
+                            row_text = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                            if row_text:
+                                full_text_list.append(" | ".join(row_text))
+                    extracted_text = "\n\n".join(full_text_list).strip()
+                except Exception as e:
+                    logger.warning(f"Failed to read DOCX file {upload.filename}: {e}")
                     raise HTTPException(
                         status_code=400,
-                        detail=f"File {upload.filename} exceeds the maximum limit of {MAX_PAGES} pages."
+                        detail=f"Failed to read DOCX file {upload.filename}."
                     )
 
-                docs = []
-                tokenized_docs = []
-
-                for i, page in enumerate(reader.pages):
-                    try:
-                        text = page.extract_text() or ""
-                    except Exception as e:
-                        logger.warning(f"Failed to extract text from page {i+1} of {upload.filename}: {e}")
-                        text = ""
-
-                    chunks = chunk_text(text)
-                    if DEBUG:
-                        logger.info(f"[DEBUG] Upload '{upload.filename}' page {i+1}: extracted {len(text)} chars, produced {len(chunks)} chunks")
-
-                    for chunk in chunks:
-                        docs.append({
-                            "page": i + 1,
-                            "content": chunk,
-                            "document_id": document_id,
-                            "filename": upload.filename,
-                        })
-                        tokenized_docs.append(chunk.lower().split())
-
-                if not docs:
+                if not extracted_text:
                     raise HTTPException(
                         status_code=400,
-                        detail=f"No text could be extracted from PDF {upload.filename}."
+                        detail=f"No text could be extracted from DOCX {upload.filename}."
                     )
-            except HTTPException:
-                raise
-            except Exception:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Failed to read PDF file {upload.filename}."
-                )
-            finally:
-                # Clean up temporary PDF file and memory immediately to reduce memory usage
-                if 'reader' in locals():
-                    del reader
-                if 'contents' in locals():
-                    del contents
-                gc.collect()
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
+
+                chunks = chunk_text(extracted_text)
+                if not chunks:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"No text could be extracted from DOCX {upload.filename}."
+                    )
+
+                for chunk in chunks:
+                    docs.append({
+                        "page": 1,
+                        "content": chunk,
+                        "document_id": document_id,
+                        "filename": upload.filename,
+                    })
+                    tokenized_docs.append(chunk.lower().split())
+
+                num_pages = 1
+
+            elif ext in [".md", ".txt"]:
+                try:
+                    extracted_text = contents.decode("utf-8").strip()
+                except UnicodeDecodeError:
+                    extracted_text = contents.decode("latin-1", errors="replace").strip()
+                except Exception as e:
+                    logger.warning(f"Failed to decode file {upload.filename}: {e}")
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Failed to read file {upload.filename}."
+                    )
+
+                if not extracted_text:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Uploaded file {upload.filename} is empty."
+                    )
+
+                chunks = chunk_text(extracted_text)
+                if not chunks:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"No text could be extracted from {upload.filename}."
+                    )
+
+                for chunk in chunks:
+                    docs.append({
+                        "page": 1,
+                        "content": chunk,
+                        "document_id": document_id,
+                        "filename": upload.filename,
+                    })
+                    tokenized_docs.append(chunk.lower().split())
+
+                num_pages = 1
 
             new_document_entries.append({
                 "document_id": document_id,
