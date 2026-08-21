@@ -64,9 +64,15 @@ export default function App() {
     const selectedFiles = files?.length ? files : f ? [f] : Array.from(fileInputRef.current?.files ?? [])
     if (selectedFiles.length === 0) return
 
-    const invalid = selectedFiles.find(file => !file.name.toLowerCase().endsWith('.pdf'))
+    const ALLOWED_EXTENSIONS = ['.pdf', '.docx', '.md', '.txt']
+    const invalid = selectedFiles.find(file => {
+      const lastDot = file.name.lastIndexOf('.')
+      if (lastDot === -1) return true
+      const ext = file.name.substring(lastDot).toLowerCase()
+      return !ALLOWED_EXTENSIONS.includes(ext)
+    })
     if (invalid) {
-      alert('Only PDF files are allowed.')
+      alert('Unsupported file format. Supported formats: PDF, DOCX, MD, TXT')
       return
     }
 
@@ -129,7 +135,7 @@ export default function App() {
         document_id: selectedDocumentId,
       })
 
-      const ans = res.data?.answer || "I couldn't find that information in the uploaded PDF."
+      const ans = res.data?.answer || "I couldn't find that information in the uploaded document."
       const sources = res.data?.sources || []
 
       setMessages(prev => [
@@ -190,12 +196,12 @@ export default function App() {
             <div className="rounded-2xl bg-brand-500 p-3 text-white shadow-sm"><UploadCloud size={20} /></div>
             <div>
               <h3 className="text-xl font-semibold">Document QA</h3>
-              <p className="text-sm text-slate-500">Upload multiple PDFs and ask questions per document.</p>
+              <p className="text-sm text-slate-500">Upload multiple documents and ask questions per document.</p>
             </div>
           </div>
 
           <div className="mb-5">
-            <label className="block text-sm font-semibold text-slate-700">Upload PDFs</label>
+            <label className="block text-sm font-semibold text-slate-700">Upload Documents</label>
             <div
               className={`mt-3 border-2 rounded-3xl p-5 text-center transition duration-200 cursor-pointer ${dragActive ? 'border-brand-500 bg-brand-50' : 'border-slate-200 bg-white hover:border-slate-300'}`}
               onClick={() => { if (!uploading) fileInputRef.current?.click() }}
@@ -206,15 +212,15 @@ export default function App() {
               <div className="flex flex-col items-center gap-3 text-slate-500">
                 <FileText size={26} />
                 <div className="text-sm font-medium">
-                  {uploading ? 'Uploading & processing...' : 'Drag & drop PDFs here'}
+                  {uploading ? 'Uploading & processing...' : 'Drag & drop files here'}
                 </div>
-                <div className="text-xs">Upload one or more PDF files (up to 100 pages each).</div>
+                <div className="text-xs">Supported formats: PDF, DOCX, MD, TXT</div>
               </div>
               <div className="mt-4">
                 <input
                   ref={fileInputRef}
                   type="file"
-                  accept="application/pdf"
+                  accept=".pdf,.docx,.md,.txt,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/markdown,text/plain"
                   multiple
                   disabled={uploading}
                   className="hidden"
@@ -236,7 +242,7 @@ export default function App() {
             <div className="space-y-4">
               <div className="flex items-center justify-between">
                 <div>
-                  <p className="text-sm font-semibold text-slate-700">Uploaded PDFs</p>
+                  <p className="text-sm font-semibold text-slate-700">Uploaded Documents</p>
                   <p className="text-xs text-slate-500">Select a document before asking.</p>
                 </div>
                 <button
@@ -276,7 +282,7 @@ export default function App() {
 
         <main className="flex-1 p-6">
           <header className="mb-6">
-            <h1 className="text-3xl font-semibold text-slate-900">Ask questions about your PDF</h1>
+            <h1 className="text-3xl font-semibold text-slate-900">Ask questions about your document</h1>
             <p className="mt-2 text-sm text-slate-500">Choose a document and get precise answers from that file only.</p>
           </header>
 
@@ -323,7 +329,7 @@ export default function App() {
               onChange={e => setQuestion(e.target.value)}
               onKeyDown={onKeyDown}
               disabled={loading || !selectedDocumentId}
-              placeholder={selectedDocumentId ? "Ask a question about the selected PDF..." : "Select a document to ask questions..."}
+              placeholder={selectedDocumentId ? "Ask a question about the selected document..." : "Select a document to ask questions..."}
               className="w-full p-3 rounded-md border disabled:bg-slate-100"
               rows={3}
             />
